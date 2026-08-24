@@ -6,17 +6,51 @@
 ``xueqiu.com`` 主域下的社区接口（讨论 / 公告 / 自选股）受阿里云 WAF 的 JS 挑战
 保护，匿名访问会被拦截。这类接口需要用户在环境变量 ``XUEQIU_COOKIE`` 中提供
 自己浏览器里的登录 Cookie。
+
+并发与资源
+----------
+本客户端面向「小机器扛住高并发」设计，具体做法：
+
+- **token 校验走无锁快速路径**。token 没过期时直接返回，不碰锁；只有真的需要
+  刷新才进临界区，进去后再确认一次（double-check）。早期版本每个请求都要抢一次
+  ``asyncio.Lock``，把并发请求全串行化了。
+- **连接池显式设限并开启 HTTP/2**。``stock.xueqiu.com`` 支持 h2，多路复用后几条
+  连接就能承载上百个并发请求，省下大量 TLS 握手和 socket 内存；不支持 h2 的域会
+  由 ALPN 自动回落到 HTTP/1.1。
+- **上游并发闸门**。在途请求数有上限，多出来的排队等待。这既是保护小机器，也是
+  避免把雪球打出风控。
+- **响应缓存 + 请求合并**。见 :mod:`.cache`。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import os
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
+
+from .cache import ResponseCache, ttl_for
+
+try:  # orjson 可选：大 JSON 解析快 2~3 倍，装了就用
+    import orjson
+
+    def _loads(raw: bytes) -> Any:
+        return orjson.loads(raw)
+except ImportError:  # pragma: no cover
+    def _loads(raw: bytes) -> Any:
+        return _json.loads(raw)
+
+try:  # 没装 h2 时 httpx(http2=True) 会直接抛错，这里探测后自动回落 HTTP/1.1
+    import h2  # noqa: F401
+
+    HTTP2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    HTTP2_AVAILABLE = False
 
 log = logging.getLogger("xueqiu_mcp")
 
@@ -41,6 +75,29 @@ BASE_HEADERS = {
 
 # token 有效期按 30 分钟保守估计，到期主动刷新
 TOKEN_TTL = 25 * 60
+# 强制刷新的最小间隔：并发请求同时撞上 token 失效时，只放一个出去刷新，
+# 其余在这个窗口内直接复用刚拿到的新 token，避免惊群。
+FORCE_REFRESH_COOLDOWN = 5.0
+
+# 解析成 Python 对象后的内存大约是原始 JSON 的 4 倍（实测 500 根 K 线：77KB → 322KB，
+# 4.2×）。缓存按这个倍率折算体积，好让 XUEQIU_CACHE_MB 直接对应真实内存占用，
+# 而不是一个需要用户自己换算的原始字节数。
+OBJECT_SIZE_FACTOR = 4
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.getenv(name, ""))
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 class XueqiuError(RuntimeError):
@@ -70,38 +127,95 @@ def _parse_cookie_string(raw: str) -> dict[str, str]:
 
 
 class XueqiuClient:
-    """带自动 token 管理的雪球接口客户端。"""
+    """带自动 token 管理、响应缓存与并发控制的雪球接口客户端。
 
-    def __init__(self, timeout: float = 15.0, user_cookie: str | None = None):
-        self._timeout = timeout
+    资源相关参数都能用环境变量覆盖，方便在小内存机器上压低占用：
+
+    ==========================  ======  ================================
+    环境变量                     默认    说明
+    ==========================  ======  ================================
+    ``XUEQIU_MAX_CONNECTIONS``   32     连接池上限
+    ``XUEQIU_MAX_CONCURRENCY``   32     同时在途的上游请求数上限
+    ``XUEQIU_CACHE_MB``          16     响应缓存的内存上限，已按解析后对象
+                                        折算，设多少就大致占多少
+    ``XUEQIU_CACHE``             1      设 0 关闭缓存
+    ``XUEQIU_HTTP2``             1      设 0 关闭 HTTP/2
+    ``XUEQIU_TIMEOUT``           15     单请求超时（秒）
+    ==========================  ======  ================================
+    """
+
+    def __init__(
+        self,
+        timeout: float | None = None,
+        user_cookie: str | None = None,
+        *,
+        max_connections: int | None = None,
+        max_concurrency: int | None = None,
+        cache_bytes: int | None = None,
+        cache_enabled: bool | None = None,
+        http2: bool | None = None,
+    ):
+        self._timeout = timeout if timeout is not None else float(_env_int("XUEQIU_TIMEOUT", 15))
         self._user_cookie = user_cookie if user_cookie is not None else os.getenv("XUEQIU_COOKIE", "")
+        self._max_connections = max_connections or _env_int("XUEQIU_MAX_CONNECTIONS", 32)
+        want_h2 = http2 if http2 is not None else _env_flag("XUEQIU_HTTP2", True)
+        self._http2 = want_h2 and HTTP2_AVAILABLE
+
         self._client: httpx.AsyncClient | None = None
         self._token_at: float = 0.0
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()        # 只保护 token 刷新
+        self._init_lock = asyncio.Lock()   # 只保护 client 首次创建
+        self._gate = asyncio.Semaphore(max_concurrency or _env_int("XUEQIU_MAX_CONCURRENCY", 32))
+
+        mb = cache_bytes if cache_bytes is not None else _env_int("XUEQIU_CACHE_MB", 16) * 1024 * 1024
+        enabled = cache_enabled if cache_enabled is not None else _env_flag("XUEQIU_CACHE", True)
+        self._cache = ResponseCache(max_bytes=mb, enabled=enabled)
+        self._upstream_calls = 0
 
     @property
     def has_user_cookie(self) -> bool:
         return bool(self._user_cookie.strip())
 
+    @property
+    def cache(self) -> ResponseCache:
+        return self._cache
+
     async def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=self._timeout,
-                headers=BASE_HEADERS,
-                follow_redirects=True,
-            )
-            if self.has_user_cookie:
-                for k, v in _parse_cookie_string(self._user_cookie).items():
-                    self._client.cookies.set(k, v, domain=".xueqiu.com")
-                self._token_at = time.time()
-        return self._client
+        # 快速路径：绝大多数调用走这里，不碰锁
+        client = self._client
+        if client is not None:
+            return client
+        async with self._init_lock:
+            if self._client is None:  # double-check，避免并发建出多个连接池
+                keepalive = max(4, self._max_connections // 2)
+                self._client = httpx.AsyncClient(
+                    timeout=self._timeout,
+                    headers=BASE_HEADERS,
+                    follow_redirects=True,
+                    http2=self._http2,
+                    limits=httpx.Limits(
+                        max_connections=self._max_connections,
+                        max_keepalive_connections=keepalive,
+                        keepalive_expiry=60.0,
+                    ),
+                )
+                if self.has_user_cookie:
+                    for k, v in _parse_cookie_string(self._user_cookie).items():
+                        self._client.cookies.set(k, v, domain=".xueqiu.com")
+                    self._token_at = time.monotonic()
+            return self._client
 
     async def _refresh_token(self, force: bool = False) -> None:
         """获取匿名 token。用户自带 Cookie 时不覆盖。"""
         if self.has_user_cookie:
             return
+        # 无锁快速路径：token 还新鲜就直接走，高并发下这是热路径
+        if not force and time.monotonic() - self._token_at < TOKEN_TTL:
+            return
         async with self._lock:
-            if not force and time.time() - self._token_at < TOKEN_TTL:
+            age = time.monotonic() - self._token_at
+            # 进临界区后再确认一次：force 时用短冷却窗口，避免并发失败触发的惊群
+            if age < (FORCE_REFRESH_COOLDOWN if force else TOKEN_TTL):
                 return
             client = await self._ensure_client()
             client.cookies.clear()
@@ -110,39 +224,38 @@ class XueqiuClient:
             await client.get(MAIN_API + "/hq", headers={"Accept": "text/html,*/*"})
             if not client.cookies.get("xq_a_token"):
                 raise XueqiuError("未能从雪球获取访问令牌，可能是网络不通或雪球改版。")
-            self._token_at = time.time()
+            self._token_at = time.monotonic()
             log.info("已刷新雪球匿名 token")
 
-    async def get(
-        self,
-        path: str,
-        params: dict[str, Any] | None = None,
-        *,
-        base: str = STOCK_API,
-        referer: str | None = None,
-    ) -> dict[str, Any]:
-        """发起 GET 请求并返回解析后的 JSON。"""
+    async def _fetch(
+        self, path: str, clean: dict[str, Any], base: str, referer: str | None
+    ) -> tuple[Any, int]:
+        """真正发请求。返回 ``(解析后的 JSON, 原始字节数)``。"""
         await self._refresh_token()
         client = await self._ensure_client()
-        clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
         headers = {"Referer": referer} if referer else None
 
-        resp = await client.get(base + path, params=clean, headers=headers)
-
-        # token 失效：强制刷新后重试一次
-        if resp.status_code in (400, 401, 403) and not self.has_user_cookie:
-            await self._refresh_token(force=True)
-            client = await self._ensure_client()
+        async with self._gate:  # 上游并发闸门
+            self._upstream_calls += 1
             resp = await client.get(base + path, params=clean, headers=headers)
 
-        body = resp.text
-        if body.lstrip().startswith(("<!doctype", "<html", "<textarea", "<!DOCTYPE")):
+            # token 失效：强制刷新后重试一次
+            if resp.status_code in (400, 401, 403) and not self.has_user_cookie:
+                await self._refresh_token(force=True)
+                resp = await client.get(base + path, params=clean, headers=headers)
+
+        raw = resp.content
+        # 只看前几个字节判断是不是 WAF 挑战页，别对整个响应体做解码和 lstrip：
+        # 500 根 K 线有 79KB，全量复制两次纯属浪费。
+        if raw[:32].lstrip()[:1] == b"<":
             raise NeedCookieError(path)
 
         try:
-            data = resp.json()
+            data = _loads(raw)
         except ValueError as exc:  # pragma: no cover - 极少发生
-            raise XueqiuError(f"接口 {path} 返回了无法解析的内容：{body[:200]}") from exc
+            raise XueqiuError(
+                f"接口 {path} 返回了无法解析的内容：{raw[:200].decode('utf-8', 'replace')}"
+            ) from exc
 
         if isinstance(data, dict):
             code = data.get("error_code")
@@ -152,19 +265,67 @@ class XueqiuClient:
                 )
             if data.get("status") and data.get("error") and "data" not in data:
                 raise XueqiuError(f"雪球接口 {path} 报错：{data.get('error')}（HTTP {data.get('status')}）")
-        return data
+        return data, len(raw) * OBJECT_SIZE_FACTOR
+
+    async def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        base: str = STOCK_API,
+        referer: str | None = None,
+        cache: bool = True,
+    ) -> dict[str, Any]:
+        """发起 GET 请求并返回解析后的 JSON。
+
+        默认按 endpoint 的分级 TTL 走缓存，并把并发的相同请求合并成一次上游调用。
+        传 ``cache=False`` 可绕过缓存。
+
+        .. warning::
+           命中缓存时返回的是**共享对象**，多个调用方拿到的是同一份数据。
+           调用方只许读，不许原地改（``sort`` / ``append`` / 改键值都不行），
+           否则会污染后续所有命中该缓存的请求。
+        """
+        clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+        ttl = ttl_for(path) if cache else 0.0
+        if ttl <= 0:
+            data, _ = await self._fetch(path, clean, base, referer)
+            return data
+
+        key = f"{base}{path}?{urlencode(sorted(clean.items()))}"
+        return await self._cache.fetch(key, ttl, lambda: self._fetch(path, clean, base, referer))
+
+    def stats(self) -> dict[str, Any]:
+        """运行时指标，便于压测和线上观测。"""
+        return {"upstream_calls": self._upstream_calls, **self._cache.stats()}
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        self._cache.clear()
+
+
+async def gather_json(*coros: Any) -> list[Any]:
+    """并发跑多个取数协程，单个失败返回 ``{}``，不牵连其他。
+
+    多数工具要拼几个互不依赖的接口（如股东结构要同时取股东户数、十大流通股东、
+    机构持仓）。串行 await 会把延迟叠加成 3 倍，这里一次性发出去。
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: list[Any] = []
+    for r in results:
+        if isinstance(r, asyncio.CancelledError):
+            raise r
+        out.append({} if isinstance(r, BaseException) else r)
+    return out
 
 
 _client: XueqiuClient | None = None
 
 
 def get_client() -> XueqiuClient:
-    """进程级单例，复用连接与 token。"""
+    """进程级单例，复用连接、token 与缓存。"""
     global _client
     if _client is None:
         _client = XueqiuClient()

@@ -8,7 +8,15 @@ license = { text = "MIT" }
 dependencies = [
     "mcp>=1.9,<3",
     "httpx>=0.27.0",
+    # HTTP/2 多路复用：stock.xueqiu.com 支持 h2，几条连接就能扛住上百并发，
+    # 省下大量 TLS 握手和 socket 内存。纯 Python 包，很轻。
+    "h2>=4.0",
 ]
+
+[project.optional-dependencies]
+# orjson 是编译包，在部分 ARM 小机器上装起来麻烦，所以放可选。
+# 装上后大 JSON（如 500 根 K 线）的解析快 2~3 倍。
+fast = ["orjson>=3.9"]
 
 [project.scripts]
 xueqiu-mcp = "xueqiu_mcp.__main__:main"

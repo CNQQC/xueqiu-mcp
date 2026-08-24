@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+
 from .client import get_client
 from .symbols import is_resolvable, normalize_symbol
+
+_SPLIT_RE = re.compile(r"[,，、;；\s]+")
 
 _STOCK_TYPE_NAME = {
     11: "A股", 12: "A股", 30: "港股", 31: "港股", 82: "科创板",
@@ -46,16 +51,34 @@ async def resolve_symbol(raw: str) -> str:
 
 
 async def resolve_many(raw: str | list[str]) -> list[str]:
-    """解析多个标的，保持输入顺序并去重。"""
+    """解析多个标的，保持输入顺序并去重。
+
+    能按规则判定的代码直接就地规范化；只有中文名之类需要走搜索的才发请求，
+    且这些请求并发发出 —— 否则查 5 个中文名就要串行等 5 个 RTT。
+    """
     if isinstance(raw, list):
         parts = raw
     else:
-        import re
+        parts = [p for p in _SPLIT_RE.split(raw or "") if p.strip()]
 
-        parts = [p for p in re.split(r"[,，、;；\s]+", raw or "") if p.strip()]
+    resolved: list[str | None] = []
+    pending: list[tuple[int, str]] = []
+    for i, p in enumerate(parts):
+        s = normalize_symbol(p)
+        if is_resolvable(s):
+            resolved.append(s)
+        else:
+            resolved.append(None)
+            pending.append((i, p))
+
+    if pending:
+        # 任一解析失败就整体抛出，与逐个 await 时的行为一致
+        hits = await asyncio.gather(*(resolve_symbol(p) for _, p in pending))
+        for (i, _), hit in zip(pending, hits):
+            resolved[i] = hit
+
     out: list[str] = []
-    for p in parts:
-        sym = await resolve_symbol(p)
-        if sym not in out:
+    for sym in resolved:
+        if sym and sym not in out:
             out.append(sym)
     return out

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ..client import get_client
+import asyncio
+
+from ..client import gather_json, get_client
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, fmt_ts, md_table
 from ..resolve import resolve_symbol
 
@@ -22,7 +24,14 @@ async def get_company_profile(symbol: str) -> str:
     sym = await resolve_symbol(symbol)
     client = get_client()
 
-    data = await client.get("/v5/stock/f10/cn/company.json", {"symbol": sym})
+    # 公司资料与行业概念互不依赖，一起发
+    data, ind_raw = await asyncio.gather(
+        client.get("/v5/stock/f10/cn/company.json", {"symbol": sym}),
+        client.get("/v5/stock/f10/cn/industry.json", {"symbol": sym}),
+        return_exceptions=True,
+    )
+    if isinstance(data, BaseException):
+        raise data
     c = (data.get("data") or {}).get("company") or {}
     if not c:
         return f"{sym} 无公司资料（该接口仅覆盖 A 股）。"
@@ -49,10 +58,7 @@ async def get_company_profile(symbol: str) -> str:
         scope = str(c["operating_scope"]).strip()
         lines.append(f"\n**经营范围**：{scope[:400]}{'…' if len(scope) > 400 else ''}")
 
-    try:
-        ind = (await client.get("/v5/stock/f10/cn/industry.json", {"symbol": sym})).get("data") or {}
-    except Exception:
-        ind = {}
+    ind = {} if isinstance(ind_raw, BaseException) else (ind_raw.get("data") or {})
     inds = ind.get("industry") or []
     cons = ind.get("concept") or []
     if inds:
@@ -68,12 +74,15 @@ async def get_shareholders(symbol: str, top_n: int = 10) -> str:
     client = get_client()
     out: list[str] = [f"### {sym} 股东结构\n"]
 
+    # 三个接口互不依赖，并发取，省掉两个 RTT
+    h_raw, t_raw, o_raw = await gather_json(
+        client.get("/v5/stock/f10/cn/holders.json", {"symbol": sym}),
+        client.get("/v5/stock/f10/cn/top_holders.json", {"symbol": sym, "circula": 1}),
+        client.get("/v5/stock/f10/cn/org_holding/detail.json", {"symbol": sym, "page": 1, "size": 10}),
+    )
+
     # 股东户数
-    try:
-        h = (await client.get("/v5/stock/f10/cn/holders.json", {"symbol": sym})).get("data") or {}
-        items = h.get("items") or []
-    except Exception:
-        items = []
+    items = (h_raw.get("data") or {}).get("items") or []
     if items:
         rows = [
             [
@@ -94,12 +103,7 @@ async def get_shareholders(symbol: str, top_n: int = 10) -> str:
         )
 
     # 十大流通股东
-    try:
-        t = (await client.get(
-            "/v5/stock/f10/cn/top_holders.json", {"symbol": sym, "circula": 1}
-        )).get("data") or {}
-    except Exception:
-        t = {}
+    t = t_raw.get("data") or {}
     holders = (t.get("items") or [])[: max(1, min(int(top_n), 20))]
     if holders:
         period = (t.get("times") or [{}])[0].get("name", "")
@@ -123,12 +127,7 @@ async def get_shareholders(symbol: str, top_n: int = 10) -> str:
             )
 
     # 机构持仓
-    try:
-        o = (await client.get(
-            "/v5/stock/f10/cn/org_holding/detail.json", {"symbol": sym, "page": 1, "size": 10}
-        )).get("data") or {}
-    except Exception:
-        o = {}
+    o = o_raw.get("data") or {}
     groups = [
         ("fund_items", "基金"), ("qfii_items", "QFII"), ("social_items", "社保"),
         ("insurance_items", "保险"), ("broker_items", "券商"), ("other_items", "其他机构"),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ..client import APP_API, get_client
@@ -167,9 +168,22 @@ async def get_post(post_id: str, with_comments: bool = True, comment_count: int 
     if not pid.isdigit():
         return "post_id 需要是帖子的数字 ID。"
 
-    st: dict[str, Any] = await get_client().get(
-        "/statuses/show.json", {"id": pid}, base=APP_API, referer=REFERER
-    )
+    client = get_client()
+    # 正文和评论只依赖 pid，一起发；评论区可能被关掉，失败不影响正文
+    tasks = [client.get("/statuses/show.json", {"id": pid}, base=APP_API, referer=REFERER)]
+    if with_comments:
+        tasks.append(
+            client.get(
+                "/statuses/comments.json",
+                {"id": pid, "count": max(1, min(int(comment_count), 30)), "page": 1},
+                base=APP_API,
+                referer=REFERER,
+            )
+        )
+    fetched = await asyncio.gather(*tasks, return_exceptions=True)
+    if isinstance(fetched[0], BaseException):
+        raise fetched[0]
+    st: dict[str, Any] = fetched[0]
     if not st.get("id"):
         return f"未找到 ID 为 {pid} 的帖子。"
 
@@ -186,16 +200,8 @@ async def get_post(post_id: str, with_comments: bool = True, comment_count: int 
     ]
 
     if with_comments:
-        try:
-            cm = await get_client().get(
-                "/statuses/comments.json",
-                {"id": pid, "count": max(1, min(int(comment_count), 30)), "page": 1},
-                base=APP_API,
-                referer=REFERER,
-            )
-            comments = cm.get("comments") or []
-        except Exception:  # 评论区可能被关闭
-            comments = []
+        cm = fetched[1]
+        comments = [] if isinstance(cm, BaseException) else (cm.get("comments") or [])
         if comments:
             out.append(f"\n#### 评论（{len(comments)} 条）")
             for i, c in enumerate(comments, 1):

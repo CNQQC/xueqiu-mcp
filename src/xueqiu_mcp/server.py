@@ -1,9 +1,15 @@
-"""雪球 MCP Server：把雪球的行情、财务、资金与社区数据暴露成 MCP 工具。"""
+"""雪球 MCP Server：把雪球的行情、财务、资金与社区数据暴露成 MCP 工具。
+
+传输方式由 ``XUEQIU_TRANSPORT`` 决定，默认 ``stdio``（Claude Desktop / Claude Code
+本地接入）。要在一台机器上同时服务多个客户端，设成 ``streamable-http``，
+再用 ``XUEQIU_HOST`` / ``XUEQIU_PORT`` 指定监听地址。
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 try:  # mcp >= 2.0
     from mcp.server import MCPServer as _Server
@@ -18,6 +24,7 @@ logging.basicConfig(
     level=os.getenv("XUEQIU_MCP_LOG", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+log = logging.getLogger("xueqiu_mcp")
 
 INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美股。
 
@@ -27,7 +34,19 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 
 数据均为雪球公开数据，行情可能有延迟，不构成投资建议。"""
 
-mcp = _Server("xueqiu", instructions=INSTRUCTIONS)
+@asynccontextmanager
+async def _lifespan(_server):
+    """进程退出时收好 HTTP 连接池，http 模式下同样有效。"""
+    try:
+        yield {}
+    finally:
+        await get_client().aclose()
+
+
+try:
+    mcp = _Server("xueqiu", instructions=INSTRUCTIONS, lifespan=_lifespan)
+except TypeError:  # 老版 mcp 不支持 lifespan
+    mcp = _Server("xueqiu", instructions=INSTRUCTIONS)
 
 
 # ------------------------------------------------------------------ 搜索与行情
@@ -337,13 +356,34 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
 
 
 def run() -> None:
-    """以 stdio 方式启动 MCP Server。"""
-    try:
-        mcp.run()
-    finally:
-        import asyncio
+    """启动 MCP Server。
 
-        try:
-            asyncio.run(get_client().aclose())
-        except RuntimeError:
-            pass
+    ==========================  ==================  ================================
+    环境变量                     默认                说明
+    ==========================  ==================  ================================
+    ``XUEQIU_TRANSPORT``         stdio               stdio / streamable-http / sse
+    ``XUEQIU_HOST``              127.0.0.1           http 模式监听地址
+    ``XUEQIU_PORT``              8000                http 模式监听端口
+    ``XUEQIU_STATELESS``         1                   http 模式不保留会话状态
+    ==========================  ==================  ================================
+
+    ``stateless`` 模式下每个请求彼此独立，服务端不为客户端保留会话，内存不随
+    连接数累积，也方便多副本横向扩展 —— 大并发场景应保持开启。
+    """
+    transport = os.getenv("XUEQIU_TRANSPORT", "stdio").strip().lower()
+    if transport in ("http", "streamable-http", "streamable_http"):
+        host = os.getenv("XUEQIU_HOST", "127.0.0.1")
+        port = int(os.getenv("XUEQIU_PORT", "8000"))
+        stateless = os.getenv("XUEQIU_STATELESS", "1").strip().lower() not in ("0", "false", "no", "off")
+        log.info("以 streamable-http 启动：http://%s:%s/mcp（stateless=%s）", host, port, stateless)
+        mcp.run(
+            "streamable-http",
+            host=host,
+            port=port,
+            stateless_http=stateless,
+            json_response=True,  # 纯请求-响应型工具，不需要 SSE 流式开销
+        )
+    elif transport == "sse":
+        mcp.run("sse", host=os.getenv("XUEQIU_HOST", "127.0.0.1"), port=int(os.getenv("XUEQIU_PORT", "8000")))
+    else:
+        mcp.run()
