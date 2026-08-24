@@ -249,10 +249,11 @@ async def list_screener_metrics(market: str = "CN", keyword: str | None = None) 
     """列出选股器支持的全部指标及其中文名（雪球官方元数据）。
 
     在使用 screen_stocks 前调用，以确认指标名的正确写法。
+    **建议总是带上 keyword**：不带时会列出全部指标，返回内容大约是带 keyword 时的 9 倍。
 
     Args:
         market: CN / HK / US
-        keyword: 按中文名或指标名过滤，如「市盈」「roe」
+        keyword: 按中文名或指标名过滤，如「市盈」「roe」。省略则返回全部指标
     """
     return await market_tools.list_screener_metrics(market, keyword)
 

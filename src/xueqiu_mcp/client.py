@@ -104,6 +104,22 @@ class XueqiuError(RuntimeError):
     """雪球接口返回的业务错误。"""
 
 
+class RateLimitedError(XueqiuError):
+    """被上游限流。
+
+    单独分出来是因为限流响应体往往也是 HTML，会被误判成 WAF 挑战页，
+    进而提示用户去配 Cookie —— 那是完全错误的处置方向：限流时该做的是降速，
+    配上自己的 Cookie 反而把限流从匿名 IP 维度升级到自己的账号维度。
+    """
+
+    def __init__(self, endpoint: str):
+        super().__init__(
+            f"接口 {endpoint} 被雪球限流（HTTP 429）。请降低请求频率后重试。\n"
+            "可以调小 XUEQIU_MAX_CONCURRENCY，或在调用侧加间隔。"
+            "不要为此配置 XUEQIU_COOKIE —— 那会把限流升级到你的账号维度。"
+        )
+
+
 class NeedCookieError(XueqiuError):
     """接口被 WAF 拦截，需要用户提供自己的 Cookie。"""
 
@@ -136,8 +152,10 @@ class XueqiuClient:
     ==========================  ======  ================================
     ``XUEQIU_MAX_CONNECTIONS``   32     连接池上限
     ``XUEQIU_MAX_CONCURRENCY``   32     同时在途的上游请求数上限
-    ``XUEQIU_CACHE_MB``          16     响应缓存的内存上限，已按解析后对象
-                                        折算，设多少就大致占多少
+    ``XUEQIU_CACHE_MB``          16     响应缓存上限。已按解析后对象折算并计入
+                                        条目自身开销，但仍是偏乐观的估计：
+                                        实测真实 RSS 增长约为该值的 1.2~1.9 倍
+                                        （小条目场景偏高）。小内存机器建议设 8
     ``XUEQIU_CACHE``             1      设 0 关闭缓存
     ``XUEQIU_HTTP2``             1      设 0 关闭 HTTP/2
     ``XUEQIU_TIMEOUT``           15     单请求超时（秒）
@@ -219,9 +237,16 @@ class XueqiuClient:
                 return
             client = await self._ensure_client()
             client.cookies.clear()
-            # 第一步取 acw_tc，第二步行情页才会下发 xq_a_token
-            await client.get(MAIN_API + "/", headers={"Accept": "text/html,*/*"})
+            # 行情页一次就能同时下发 acw_tc 和 xq_a_token，不必先访问首页。
+            # （首页那一跳曾经是必须的，实测已不需要，省下约 95ms 和 110KB 传输。）
+            self._upstream_calls += 1
             await client.get(MAIN_API + "/hq", headers={"Accept": "text/html,*/*"})
+            if not client.cookies.get("xq_a_token"):
+                # 兜底：雪球若改回「必须先过首页」的行为，这条路仍然走得通
+                self._upstream_calls += 1
+                await client.get(MAIN_API + "/", headers={"Accept": "text/html,*/*"})
+                self._upstream_calls += 1
+                await client.get(MAIN_API + "/hq", headers={"Accept": "text/html,*/*"})
             if not client.cookies.get("xq_a_token"):
                 raise XueqiuError("未能从雪球获取访问令牌，可能是网络不通或雪球改版。")
             self._token_at = time.monotonic()
@@ -239,10 +264,17 @@ class XueqiuClient:
             self._upstream_calls += 1
             resp = await client.get(base + path, params=clean, headers=headers)
 
+            # 限流要单独认出来：它的响应体常常也是 HTML，会被下面的挑战页判定误伤
+            if resp.status_code == 429:
+                raise RateLimitedError(path)
+
             # token 失效：强制刷新后重试一次
             if resp.status_code in (400, 401, 403) and not self.has_user_cookie:
                 await self._refresh_token(force=True)
+                self._upstream_calls += 1
                 resp = await client.get(base + path, params=clean, headers=headers)
+                if resp.status_code == 429:
+                    raise RateLimitedError(path)
 
         raw = resp.content
         # 只看前几个字节判断是不是 WAF 挑战页，别对整个响应体做解码和 lstrip：

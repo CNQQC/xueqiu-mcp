@@ -41,6 +41,16 @@ TTL_RULES: tuple[tuple[str, float], ...] = (
 DEFAULT_TTL = 30.0
 
 
+class _LeaderCancelled(Exception):
+    """发起上游请求的那个协程被取消了。
+
+    合并进来的其他协程自己并没有被取消，不该跟着一起死 —— 更要命的是，把
+    ``CancelledError`` 传给它们会被 asyncio 当成「这些任务也被取消了」，
+    杂散取消逃出各自的 cancel scope 后会让 MCP 的 TaskGroup 直接拆掉整个会话，
+    客户端必须重连。所以这里换一个普通异常，收到的人重新发起请求即可。
+    """
+
+
 def ttl_for(path: str) -> float:
     """按最长前缀匹配取 TTL。"""
     best, best_len = DEFAULT_TTL, -1
@@ -53,7 +63,8 @@ def ttl_for(path: str) -> float:
 class ResponseCache:
     """TTL + LRU + 字节上限的异步缓存，内置 single-flight。"""
 
-    __slots__ = ("_data", "_bytes", "_max_bytes", "_inflight", "hits", "misses", "merged", "enabled")
+    __slots__ = ("_data", "_bytes", "_max_bytes", "_inflight", "hits", "misses",
+                 "merged", "oversized", "enabled")
 
     def __init__(self, max_bytes: int = 32 * 1024 * 1024, enabled: bool = True):
         # key -> (到期时间, 值, 体积)；dict 保序，用作 LRU
@@ -61,7 +72,7 @@ class ResponseCache:
         self._bytes = 0
         self._max_bytes = max_bytes
         self._inflight: dict[str, asyncio.Future] = {}
-        self.hits = self.misses = self.merged = 0
+        self.hits = self.misses = self.merged = self.oversized = 0
         self.enabled = enabled
 
     def _evict(self) -> None:
@@ -89,6 +100,14 @@ class ResponseCache:
     def put(self, key: str, value: Any, ttl: float, size: int) -> None:
         if not self.enabled or ttl <= 0:
             return
+        # 记账要把条目自身的开销算进去（key 字符串 + dict 槽位 + 元组），实测约 273B/条。
+        # 否则小条目场景下真实内存会显著超过 XUEQIU_CACHE_MB。
+        size += len(key) * 2 + 200
+        if size > self._max_bytes:
+            # 单条就超上限：存进去也会被 _evict 立刻淘汰掉自己，白白挤走别人。
+            # 直接不收，并记一笔，免得在 stats 里表现为「entries 恒为 0」这种查不出的怪事。
+            self.oversized += 1
+            return
         old = self._data.pop(key, None)
         if old is not None:
             self._bytes -= old[2]
@@ -96,7 +115,13 @@ class ResponseCache:
         self._bytes += size
         self._evict()
 
-    async def fetch(self, key: str, ttl: float, loader: Callable[[], Awaitable[tuple[Any, int]]]) -> Any:
+    async def fetch(
+        self,
+        key: str,
+        ttl: float,
+        loader: Callable[[], Awaitable[tuple[Any, int]]],
+        _depth: int = 0,
+    ) -> Any:
         """取缓存；未命中则调用 loader，并合并同 key 的并发请求。
 
         loader 需返回 ``(值, 体积字节数)``。
@@ -109,7 +134,14 @@ class ResponseCache:
         fut = self._inflight.get(key)
         if fut is not None:
             self.merged += 1
-            return await asyncio.shield(fut)
+            try:
+                return await asyncio.shield(fut)
+            except _LeaderCancelled:
+                # 发起请求的那个协程被取消了，但我们自己没有。重来一次 ——
+                # 此时 inflight 已清空，这一轮多半由我们自己去打上游。
+                if _depth >= 2:
+                    raise RuntimeError(f"上游请求连续被取消，放弃：{key}") from None
+                return await self.fetch(key, ttl, loader, _depth + 1)
 
         self.misses += 1
         loop = asyncio.get_running_loop()
@@ -117,6 +149,12 @@ class ResponseCache:
         self._inflight[key] = fut
         try:
             value, size = await loader()
+        except asyncio.CancelledError:
+            # 只有自己该被取消，合并进来的人不该受牵连。详见 _LeaderCancelled。
+            if not fut.done():
+                fut.set_exception(_LeaderCancelled())
+            fut.exception()
+            raise
         except BaseException as exc:
             if not fut.done():
                 fut.set_exception(exc)
@@ -143,6 +181,7 @@ class ResponseCache:
             "hits": self.hits,
             "misses": self.misses,
             "merged": self.merged,
+            "oversized": self.oversized,
             "hit_rate": round(self.hits / total, 4) if total else 0.0,
             "inflight": len(self._inflight),
         }

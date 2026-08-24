@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from ..cache import ttl_for
 from ..client import get_client
 from ..fields import QUOTE_BRIEF, QUOTE_FIELDS
 from ..formatting import (
@@ -24,6 +25,8 @@ KLINE_PERIODS = {
     "day": "day", "week": "week", "month": "month", "quarter": "quarter", "year": "year",
 }
 ADJUST_TYPES = {"before": "前复权", "after": "后复权", "normal": "不复权"}
+
+KLINE_PATH = "/v5/stock/chart/kline.json"
 
 
 async def search_stock(query: str, limit: int = 10) -> str:
@@ -87,11 +90,16 @@ async def get_kline(
     if with_valuation:
         indicator += ",pe,pb,ps,market_capital"
 
+    # begin 若用毫秒级当前时间，每次调用的 cache key 都不一样，K 线缓存会 100% 落空，
+    # 还会把大条目不断塞进缓存挤掉别的端点。量化到 TTL 边界即可，返回数据完全相同。
+    step = max(1.0, ttl_for(KLINE_PATH))
+    begin = int(time.time() // step * step * 1000)
+
     data = await get_client().get(
-        "/v5/stock/chart/kline.json",
+        KLINE_PATH,
         {
             "symbol": sym,
-            "begin": int(time.time() * 1000),
+            "begin": begin,
             "period": period,
             "type": adjust,
             "count": -count,

@@ -125,8 +125,25 @@ def fmt_by_unit(value: Any, unit: str, currency: str | None = None) -> str:
     return str(value)
 
 
+def _prev_period(value: Any, yoy: Any) -> float | None:
+    """由当前值和同比增长率反推上年同期值。"""
+    try:
+        v, y = float(value), float(yoy)
+    except (TypeError, ValueError):
+        return None
+    if abs(1.0 + y) < 1e-9:  # 同比 -100%，反推会除零
+        return None
+    return v / (1.0 + y)
+
+
 def fmt_metric(cell: Any, unit: str, currency: str | None = None) -> str:
-    """财报里的 ``[数值, 同比增长率]`` → ``1,720.54亿元 (同比-1.20%)``。"""
+    """财报里的 ``[数值, 同比增长率]`` → ``1,720.54亿元 (同比-1.20%)``。
+
+    指标本身就是百分比时（ROE、毛利率、增长率等）不能这么写：``12.08% (同比+3.87%)``
+    里两个百分号语义完全不同 —— 前者是值，后者是**相对变化率**，但最自然的读法是
+    「上升了 3.87 个百分点」。按真实数据算，这一误读会把 ROE 的实际变化（+0.45pp）
+    夸大 8.6 倍。所以这类指标改为直接给出上年同期值，让对比基数一目了然。
+    """
     if isinstance(cell, (list, tuple)):
         value = cell[0] if cell else None
         yoy = cell[1] if len(cell) > 1 else None
@@ -135,6 +152,10 @@ def fmt_metric(cell: Any, unit: str, currency: str | None = None) -> str:
     body = fmt_by_unit(value, unit, currency)
     if yoy is None or body == "-":
         return body
+    if unit in ("pct", "rate"):
+        prev = _prev_period(value, yoy)
+        if prev is not None:
+            return f"{body}（上年同期 {fmt_by_unit(prev, unit, currency)}）"
     return f"{body} (同比{fmt_rate(yoy)})"
 
 

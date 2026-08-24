@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..client import get_client
+from ..client import gather_json, get_client
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, fmt_ts, md_table
 from ..resolve import resolve_symbol
 
@@ -14,9 +14,12 @@ async def get_capital_flow(symbol: str, days: int = 10) -> str:
     days = max(1, min(int(days), 60))
     out = [f"### {sym} 资金流向\n"]
 
-    hist = (await client.get(
-        "/v5/stock/capital/history.json", {"symbol": sym, "count": days}
-    )).get("data") or {}
+    # 两个接口都只依赖 sym，一起发
+    hist_raw, assort_raw = await gather_json(
+        client.get("/v5/stock/capital/history.json", {"symbol": sym, "count": days}),
+        client.get("/v5/stock/capital/assort.json", {"symbol": sym}),
+    )
+    hist = hist_raw.get("data") or {}
     # 该接口忽略 count，固定返回约 20 个交易日，这里在客户端截断
     items = (hist.get("items") or [])[-days:]
     if items:
@@ -31,10 +34,7 @@ async def get_capital_flow(symbol: str, days: int = 10) -> str:
         out.append(f"\n**每日主力净流入（近 {len(rows)} 个交易日）**\n")
         out.append(md_table(["日期", "主力净流入"], rows))
 
-    try:
-        a = (await client.get("/v5/stock/capital/assort.json", {"symbol": sym})).get("data") or {}
-    except Exception:
-        a = {}
+    a = assort_raw.get("data") or {}
     if a and a.get("buy_total") is not None:
         levels = [
             ("特大单", "buy_xlarge", "sell_xlarge"),
