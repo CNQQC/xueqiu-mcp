@@ -1,0 +1,21 @@
+[project]
+name = "xueqiu-mcp"
+version = "0.1.0"
+description = "雪球(xueqiu.com)行情与财务数据的 MCP Server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.9,<3",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+xueqiu-mcp = "xueqiu_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xueqiu_mcp"]
