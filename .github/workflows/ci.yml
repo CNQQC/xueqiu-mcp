@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 零网络测试：缓存层与登录/凭证层。这是唯一卡住合并的门禁 —— 它的红绿只取决于
+  # 本仓库的代码，不受雪球接口可用性影响。
+  offline:
+    name: 离线测试 (py${{ matrix.python }}${{ matrix.extras && ' + orjson' || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        extras: [""]
+        include:
+          # client.py 的 JSON 解析在装了 orjson 时走另一条分支，单独覆盖一次
+          - python: "3.12"
+            extras: "[fast]"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装
+        run: pip install -e ".${{ matrix.extras }}"
+
+      - name: 导入自检
+        # 装完就 import 一次：CI 里最常见的失败是依赖装不上或语法错，
+        # 让它在跑测试前就以清楚的报错停下
+        run: python -c "import xueqiu_mcp.server, xueqiu_mcp.auth; print('import ok')"
+
+      - name: 缓存层测试
+        run: python tests/test_cache.py
+
+      - name: 登录与凭证测试
+        # 该用例会把 XUEQIU_COOKIE_FILE 指向临时目录，不会碰到 ~/.xueqiu-mcp/
+        run: python tests/test_auth.py
