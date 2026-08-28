@@ -17,7 +17,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server
 
 from .client import get_client
-from .tools import capital, f10, finance, quote, social
+from .tools import account, capital, f10, finance, quote, social
 from .tools import market as market_tools
 
 logging.basicConfig(
@@ -32,7 +32,14 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 港股用 5 位数字如 00700，美股用字母代码如 AAPL。也可以直接传中文名称
 （如「贵州茅台」），工具会先走搜索再取数。
 
-数据均为雪球公开数据，行情可能有延迟，不构成投资建议。"""
+数据均为雪球公开数据，行情可能有延迟，不构成投资建议。
+
+默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
+
+关于登录：少数受风控保护的社区接口和账号相关数据需要登录。任何工具一旦因为未登录
+而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，引导
+用户拿到浏览器 Cookie 后交给你，再由你调用 login_with_cookie 完成登录，不要只回一句
+「需要登录」就停下。不确定当前登录态时，用 login_status 查。"""
 
 @asynccontextmanager
 async def _lifespan(_server):
@@ -354,6 +361,44 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
         page: 页码
     """
     return await social.get_user_posts(user_id, count, page)
+
+
+# ------------------------------------------------------------------ 账号
+@mcp.tool()
+async def login_status() -> str:
+    """查看当前是匿名还是已登录，以及登录的是哪个雪球账号。
+
+    某个接口报「被风控拦截」或「需要登录」时，先用它确认登录态。
+    """
+    return await account.login_status()
+
+
+@mcp.tool()
+async def login_with_cookie(cookie: str, remember: bool = True) -> str:
+    """用浏览器里的 Cookie 登录雪球，解锁受风控保护的社区接口与账号数据。
+
+    获取方式：浏览器登录 xueqiu.com → 开发者工具 Network → 任意请求的 Cookie
+    请求头 → 复制整串。必须是完整的一串，只截几项会缺少登录身份。
+    校验不通过时不会保存，也不会破坏已有的登录态。
+
+    注意：不要用这个工具传手机号密码。需要密码登录请在服务器命令行执行
+    `xueqiu-mcp login`，密码不会经过这里。
+
+    Args:
+        cookie: 完整 Cookie 串，形如 `xq_a_token=...; xq_id_token=...; u=...`
+        remember: 为 true 时保存到本地凭证文件（权限 0600），重启后仍有效
+    """
+    return await account.login_with_cookie(cookie, remember)
+
+
+@mcp.tool()
+async def logout(forget: bool = True) -> str:
+    """退出登录，回到匿名模式。
+
+    Args:
+        forget: 为 true 时同时删除本地凭证文件，false 则只在本次进程内失效
+    """
+    return await account.logout(forget)
 
 
 def run() -> None:

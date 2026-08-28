@@ -11,5 +11,10 @@ build/
 .pytest_cache/
 uv.lock
 
+# 登录凭证。默认落在 ~/.xueqiu-mcp/，但 XUEQIU_COOKIE_FILE 可以指到项目目录，
+# 这条是防手滑把登录态提交上去
+cookies.json
+.xueqiu-mcp/
+
 # 本地个人配置脚本，含私人凭据，不发布
 install-desktop-mcp.sh

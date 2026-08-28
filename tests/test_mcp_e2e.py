@@ -46,6 +46,10 @@ CASES: list[tuple[str, dict, list[str]]] = [
     ("get_stock_discussions", {"symbol": "600519", "sort": "bad"}, ["仅支持"]),
     ("get_post", {"post_id": "abc"}, ["数字 ID"]),
     ("search_stock", {"query": "不存在的公司名xyz123"}, ["未搜索到"]),
+    # --- 账号：只测不改变登录态的路径，别把跑测试的人踢下线 ---
+    ("login_status", {}, ["登录"]),
+    ("login_with_cookie", {"cookie": "foo=bar"}, ["没有登录身份"]),
+    ("login_with_cookie", {"cookie": "  "}, ["没能从这串文本里解析"]),
 ]
 
 

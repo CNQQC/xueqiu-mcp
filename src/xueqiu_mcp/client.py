@@ -4,8 +4,9 @@
 先访问首页、再访问行情页的方式自动获取，过期后自动重新获取一次。
 
 ``xueqiu.com`` 主域下的社区接口（讨论 / 公告 / 自选股）受阿里云 WAF 的 JS 挑战
-保护，匿名访问会被拦截。这类接口需要用户在环境变量 ``XUEQIU_COOKIE`` 中提供
-自己浏览器里的登录 Cookie。
+保护，匿名访问会被拦截。这类接口需要一份登录凭证，来源见 :mod:`.auth`：命令行
+``xueqiu-mcp login``、MCP 工具 ``login_with_cookie``，或环境变量 ``XUEQIU_COOKIE``。
+凭证可以在运行中随时切换（:meth:`XueqiuClient.set_user_cookie`），不必重启进程。
 
 并发与资源
 ----------
@@ -34,6 +35,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from .auth import LOGIN_GUIDE, format_cookie_string, parse_cookie_string, resolve_cookie
 from .cache import ResponseCache, ttl_for
 
 try:  # orjson 可选：大 JSON 解析快 2~3 倍，装了就用
@@ -125,21 +127,40 @@ class NeedCookieError(XueqiuError):
 
     def __init__(self, endpoint: str):
         super().__init__(
-            f"接口 {endpoint} 被雪球的风控拦截，匿名访问不可用。\n"
-            "请在浏览器登录 xueqiu.com 后，从开发者工具复制完整 Cookie，"
-            "配置到环境变量 XUEQIU_COOKIE 后重启本 MCP Server。"
+            f"接口 {endpoint} 被雪球的风控拦截，匿名访问不可用。\n\n{LOGIN_GUIDE}"
         )
 
 
-def _parse_cookie_string(raw: str) -> dict[str, str]:
-    jar: dict[str, str] = {}
-    for piece in raw.split(";"):
-        piece = piece.strip()
-        if not piece or "=" not in piece:
-            continue
-        k, _, v = piece.partition("=")
-        jar[k.strip()] = v.strip()
-    return jar
+# 雪球用来表示「这次请求没有登录身份」的错误码。
+# 10022 用户未登录；10020 会话失效（描述里写「重新登录」）；60201 用户 id 无效
+# —— 自选股一类接口在匿名时就报这个。
+NEED_LOGIN_CODES = {"10020", "10022", "60201"}
+NEED_LOGIN_HINTS = ("未登录", "重新登录", "请登录", "登录后")
+
+
+class NeedLoginError(XueqiuError):
+    """接口本身通了，但雪球说这次请求没有登录身份（或登录态已失效）。
+
+    和 :class:`NeedCookieError` 分开，是因为两者的现场完全不同：那个拿回来的是
+    WAF 挑战页，这个拿回来的是一个正常的 JSON 错误。但对用户来说出路是同一条，
+    所以两者都把完整的登录指引带上。
+    """
+
+    def __init__(self, endpoint: str, desc: str = ""):
+        detail = f"：{desc}" if desc else ""
+        super().__init__(f"接口 {endpoint} 需要登录{detail}\n\n{LOGIN_GUIDE}")
+
+
+def raise_business_error(endpoint: str, code: Any, desc: str) -> None:
+    """把雪球的业务错误码翻成异常。永远抛，不返回。
+
+    先认「没登录」再落到通用报错：这类失败有明确的出路（去登录），不该被混在一句
+    干巴巴的「雪球接口报错」里 —— 那样模型只会把错误原样转述给用户，然后双方都
+    停在原地。
+    """
+    if str(code) in NEED_LOGIN_CODES or any(h in desc for h in NEED_LOGIN_HINTS):
+        raise NeedLoginError(endpoint, desc)
+    raise XueqiuError(f"雪球接口 {endpoint} 报错：{desc or code}")
 
 
 class XueqiuClient:
@@ -159,6 +180,8 @@ class XueqiuClient:
     ``XUEQIU_CACHE``             1      设 0 关闭缓存
     ``XUEQIU_HTTP2``             1      设 0 关闭 HTTP/2
     ``XUEQIU_TIMEOUT``           15     单请求超时（秒）
+    ``XUEQIU_COOKIE``            -      登录 Cookie，优先于凭证文件
+    ``XUEQIU_COOKIE_FILE``       -      凭证文件路径，默认 ``~/.xueqiu-mcp/cookies.json``
     ==========================  ======  ================================
     """
 
@@ -174,7 +197,7 @@ class XueqiuClient:
         http2: bool | None = None,
     ):
         self._timeout = timeout if timeout is not None else float(_env_int("XUEQIU_TIMEOUT", 15))
-        self._user_cookie = user_cookie if user_cookie is not None else os.getenv("XUEQIU_COOKIE", "")
+        self._user_cookie, self._cookie_source = resolve_cookie(user_cookie)
         self._max_connections = max_connections or _env_int("XUEQIU_MAX_CONNECTIONS", 32)
         want_h2 = http2 if http2 is not None else _env_flag("XUEQIU_HTTP2", True)
         self._http2 = want_h2 and HTTP2_AVAILABLE
@@ -193,6 +216,44 @@ class XueqiuClient:
     @property
     def has_user_cookie(self) -> bool:
         return bool(self._user_cookie.strip())
+
+    @property
+    def cookie_source(self) -> str:
+        """当前登录凭证的来源描述，未登录时是空串。"""
+        return self._cookie_source
+
+    @property
+    def user_cookie(self) -> str:
+        return self._user_cookie
+
+    @property
+    def user_cookies(self) -> dict[str, str]:
+        return parse_cookie_string(self._user_cookie)
+
+    def set_user_cookie(self, cookie: str | dict[str, str], source: str = "本次会话登录") -> None:
+        """换上一份登录凭证，立即对后续请求生效。
+
+        缓存会被清空：同一个 URL 在匿名态和登录态下可能返回不同内容（社区接口尤其
+        明显），留着旧条目会让刚登录的用户继续读到匿名时的结果。
+        """
+        self._user_cookie = cookie if isinstance(cookie, str) else format_cookie_string(cookie)
+        self._cookie_source = source
+        client = self._client
+        if client is not None:
+            client.cookies.clear()
+            for k, v in parse_cookie_string(self._user_cookie).items():
+                client.cookies.set(k, v, domain=".xueqiu.com")
+        self._token_at = time.monotonic()
+        self._cache.clear()
+
+    def clear_user_cookie(self) -> None:
+        """丢掉登录凭证，退回匿名模式。下一个请求会重新去拿匿名 token。"""
+        self._user_cookie = ""
+        self._cookie_source = ""
+        if self._client is not None:
+            self._client.cookies.clear()
+        self._token_at = 0.0
+        self._cache.clear()
 
     @property
     def cache(self) -> ResponseCache:
@@ -218,7 +279,7 @@ class XueqiuClient:
                     ),
                 )
                 if self.has_user_cookie:
-                    for k, v in _parse_cookie_string(self._user_cookie).items():
+                    for k, v in parse_cookie_string(self._user_cookie).items():
                         self._client.cookies.set(k, v, domain=".xueqiu.com")
                     self._token_at = time.monotonic()
             return self._client
@@ -292,8 +353,8 @@ class XueqiuClient:
         if isinstance(data, dict):
             code = data.get("error_code")
             if code not in (None, 0, "0"):
-                raise XueqiuError(
-                    f"雪球接口 {path} 报错：{data.get('error_description') or data.get('error_msg') or code}"
+                raise_business_error(
+                    path, code, str(data.get("error_description") or data.get("error_msg") or "")
                 )
             if data.get("status") and data.get("error") and "data" not in data:
                 raise XueqiuError(f"雪球接口 {path} 报错：{data.get('error')}（HTTP {data.get('status')}）")
