@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from mcp import ClientSession, StdioServerParameters
@@ -53,6 +54,18 @@ CASES: list[tuple[str, dict, list[str]]] = [
 ]
 
 
+# 雪球的搜索接口对境外 IP 返回空结果（接口本身 200，只是搜不到东西）。GitHub runner
+# 在美国，跑巡检时这一条必然失败。设了 XUEQIU_E2E_GEO_TOLERANT 就把这种**明确可辨认
+# 的**地域限制记为跳过而不是失败 —— 让每周巡检红的时候是真的坏了，而不是「又是那条」。
+# 本地默认不开，仍然严格。
+GEO_TOLERANT = os.getenv("XUEQIU_E2E_GEO_TOLERANT", "").strip() not in ("", "0", "false")
+GEO_BLOCKED_HINT = "未搜索到"
+
+
+def _geo_limited(name: str, body: str) -> bool:
+    return GEO_TOLERANT and name == "search_stock" and GEO_BLOCKED_HINT in body
+
+
 def _is_error(res) -> bool:
     """mcp 1.x 用 isError，2.x 用 is_error。"""
     return bool(getattr(res, "is_error", None) or getattr(res, "isError", None))
@@ -60,7 +73,7 @@ def _is_error(res) -> bool:
 
 async def main() -> int:
     params = StdioServerParameters(command=sys.executable, args=["-m", "xueqiu_mcp"])
-    ok = fail = 0
+    ok = fail = skip = 0
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
@@ -99,7 +112,10 @@ async def main() -> int:
                         c.text for c in res.content if getattr(c, "text", None)
                     )
                     missing_kw = [k for k in expect if k not in body]
-                    if _is_error(res) or missing_kw:
+                    if missing_kw and not _is_error(res) and _geo_limited(name, body):
+                        skip += 1
+                        print(f"⚠️  {name:26} 跳过：搜索接口对境外 IP 返回空结果")
+                    elif _is_error(res) or missing_kw:
                         fail += 1
                         print(f"❌ {name}({args})")
                         print(f"   缺少关键字 {missing_kw}")
@@ -111,7 +127,8 @@ async def main() -> int:
                     fail += 1
                     print(f"❌ {name}({args}) 异常: {type(e).__name__}: {e}")
 
-    print(f"\n通过 {ok} / {ok + fail}")
+    tail = f"，跳过 {skip}" if skip else ""
+    print(f"\n通过 {ok} / {ok + fail}{tail}")
     return 0 if fail == 0 else 1
 
 

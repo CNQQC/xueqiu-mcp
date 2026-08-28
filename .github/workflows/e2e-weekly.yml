@@ -20,4 +20,9 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[fast]"
-      - run: python tests/test_mcp_e2e.py
+      - name: 实调全部工具
+        # runner 在境外，雪球的搜索接口对境外 IP 返回空结果。这一条记为跳过，
+        # 其余全部照常严格校验 —— 否则每周固定红一条，红久了就没人看了。
+        env:
+          XUEQIU_E2E_GEO_TOLERANT: "1"
+        run: python tests/test_mcp_e2e.py

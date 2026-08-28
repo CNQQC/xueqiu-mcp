@@ -1,13 +1,22 @@
-"""雪球社区（论坛）类工具：个股讨论、新闻公告、热帖、搜帖、帖子详情与评论、用户动态。"""
+"""雪球社区（论坛）类工具：个股讨论、新闻公告、热帖、搜帖、帖子详情与评论、用户动态。
+
+长文正文这里有个坑：``api.xueqiu.com`` 对长帖返回的 ``text`` 常常是截断的，甚至
+只有一段 ``description`` 摘要（实测同一篇帖子 API 给 170 字、页面里有 6900 字）。
+:func:`get_post` 因此会在识别出截断时，调本地浏览器把完整正文补回来
+（见 :mod:`..browser`）。没装浏览器支持就照常返回摘要，并附一行提示。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from ..client import APP_API, get_client
 from ..formatting import fmt_count, fmt_ts, post_url, strip_html
 from ..resolve import resolve_symbol
+
+log = logging.getLogger("xueqiu_mcp")
 
 REFERER = "https://xueqiu.com/"
 
@@ -162,8 +171,51 @@ async def search_posts(query: str, count: int = 10, page: int = 1) -> str:
     )
 
 
-async def get_post(post_id: str, with_comments: bool = True, comment_count: int = 10) -> str:
-    """帖子全文及热门评论。post_id 可从讨论 / 热帖列表里取。"""
+def _looks_truncated(st: dict) -> bool:
+    """API 给的正文是不是缺斤少两。
+
+    三个信号，命中任一就算：雪球自己打了 ``truncated`` 标；正文整个是空的（长文
+    匿名取常常只剩 ``description``）；或者有标题的长文正文却短得不合常理。
+    """
+    if st.get("truncated"):
+        return True
+    text = strip_html(st.get("text"))
+    if not text:
+        return bool(strip_html(st.get("description")))
+    return bool(st.get("title")) and len(text) <= 200
+
+
+async def _complete_body(st: dict) -> tuple[dict, str]:
+    """用本地浏览器把截断的正文补全，返回 ``(帖子, 给用户的说明)``。
+
+    补全失败一律降级 —— 摘要总比报错强，说明里写清楚为什么不全就行。
+    """
+    from .. import browser
+
+    if not browser.available():
+        return st, (
+            "\n\n> ℹ️ 雪球接口对这篇长文只给了摘要。装上本地浏览器支持"
+            "（`pip install -e \".[browser]\"` + `playwright install chromium`）后，"
+            "本工具会自动取回完整正文。"
+        )
+    try:
+        full = await browser.get_session().fetch_status(st.get("id"), st.get("user_id"))
+    except Exception as exc:  # 浏览器路径失败不该让整个工具失败
+        log.warning("浏览器补全帖子 %s 正文失败：%s", st.get("id"), exc)
+        return st, f"\n\n> ⚠️ 正文可能不完整，本地浏览器补全失败：{exc}"
+
+    if len(str(full.get("text") or "")) > len(str(st.get("text") or "")):
+        return {**st, "text": full["text"]}, "\n\n> ℹ️ 完整正文由本地浏览器取回。"
+    return st, ""
+
+
+async def get_post(
+    post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True
+) -> str:
+    """帖子全文及热门评论。post_id 可从讨论 / 热帖列表里取。
+
+    ``full_text`` 为真时，正文被截断就自动走本地浏览器补全。
+    """
     pid = str(post_id).strip().rstrip("/").split("/")[-1]
     if not pid.isdigit():
         return "post_id 需要是帖子的数字 ID。"
@@ -186,6 +238,10 @@ async def get_post(post_id: str, with_comments: bool = True, comment_count: int 
     st: dict[str, Any] = fetched[0]
     if not st.get("id"):
         return f"未找到 ID 为 {pid} 的帖子。"
+
+    note = ""
+    if full_text and _looks_truncated(st):
+        st, note = await _complete_body(st)
 
     _, who = _author(st)
     title = strip_html(st.get("title"))
@@ -211,7 +267,7 @@ async def get_post(post_id: str, with_comments: bool = True, comment_count: int 
                     f"　{fmt_ts(c.get('created_at'), '%m-%d %H:%M')}\n"
                     f"   {strip_html(c.get('text'), 200)}"
                 )
-    return "\n".join(out)
+    return "\n".join(out) + note
 
 
 async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:

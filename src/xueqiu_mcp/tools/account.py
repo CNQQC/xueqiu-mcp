@@ -107,3 +107,73 @@ async def logout(forget: bool = True) -> str:
             "但重启后会再次被读取 —— 需要彻底退出请把它一并清掉。"
         )
     return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ 浏览器登录
+def _qr_block(res: dict) -> str:
+    """把二维码渲染成一段「请原样输出」的说明。
+
+    字符画被模型改掉一个字符就扫不出来了，所以既明确要求原样输出，又给一份 PNG
+    路径兜底 —— 真被转述坏了，用户还能直接打开图片扫。
+    """
+    lines = [
+        "请用**雪球 App** 扫描下面的二维码登录。",
+        "⚠️ 下面这段字符画请**原样、完整**输出给用户，不要改写、缩排或转述，否则扫不出来：",
+        "",
+        "```",
+        res["qr_text"],
+        "```",
+    ]
+    if res.get("qr_png"):
+        lines.append(f"\n扫不出来就让用户直接打开这张图片：`{res['qr_png']}`")
+    return "\n".join(lines)
+
+
+async def browser_login(mode: str = "qrcode", wait: int = 90, remember: bool = True) -> str:
+    """用本机浏览器登录雪球，成功后登录态自动接管给后续所有请求。"""
+    from .. import browser
+
+    if mode not in ("qrcode", "window"):
+        return "mode 仅支持 qrcode（无头 + 扫码，默认）或 window（弹出窗口自己登录）。"
+
+    session = browser.get_session()
+    try:
+        res = await session.open_login(mode)
+    except browser.BrowserUnavailable as exc:
+        return f"无法启动本地浏览器：\n\n{exc}"
+
+    # profile 里还留着上次的登录态，直接接管，不用再扫一次
+    if res["logged_in"]:
+        await session.adopt_cookies(remember)
+        return "浏览器里已经是登录状态，登录态已接管 ✅\n\n" + await login_status()
+
+    if mode == "qrcode" and not res.get("qr_text"):
+        return (
+            "登录页打开了，但没读出二维码（雪球页面结构可能变了）。\n"
+            '请改用窗口模式：browser_login(mode="window")，在弹出的浏览器里自己完成登录。'
+        )
+
+    head = _qr_block(res) if mode == "qrcode" else (
+        "已弹出浏览器窗口，请在窗口里完成登录（扫码 / 短信验证码 / 微信都行）。"
+    )
+    jar = await session.wait_login(timeout=max(0, int(wait)))
+    if not jar:
+        return (
+            f"{head}\n\n⏳ 等了 {int(wait)} 秒还没等到登录完成。浏览器仍开着，"
+            "用户扫完码后再调用一次 browser_login 就能接管（不会重新扫码）。"
+        )
+
+    await session.adopt_cookies(remember)
+    tail = "凭证已落盘，重启后仍然有效。" if remember else "仅本次进程有效，未落盘。"
+    return f"登录成功 ✅ {tail}\n\n" + await login_status()
+
+
+async def browser_close() -> str:
+    """关掉本机浏览器释放内存。登录态留在 profile 里，不会丢。"""
+    from .. import browser
+
+    session = browser.get_session()
+    if not session.running:
+        return "本地浏览器当前没有运行。"
+    await session.close()
+    return f"本地浏览器已关闭，登录态保留在 {browser.profile_dir()}，下次要用会自动拉起。"
