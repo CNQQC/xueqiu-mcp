@@ -1,0 +1,11 @@
+[Unit]
+Description=拉取 xueqiu-mcp 的最新代码并在有变化时部署
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xueqiu-deploy
+# 拉不动或部署失败不该让定时器停摆，下一次照常再试
+SuccessExitStatus=0 1
+TimeoutStartSec=300

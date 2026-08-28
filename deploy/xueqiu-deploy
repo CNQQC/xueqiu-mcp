@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# 部署入口（安装到 /usr/local/bin/xueqiu-deploy）。
+#
+# 拆成「稳定的入口 + 仓库里的脚本」两段，是因为 bash 边读边执行：如果让定时器直接跑
+# 仓库里的 deploy.sh，fetch 正好把这个文件换掉，正在执行的脚本会读到错位的内容。
+# 这里先把仓库更新完，再 exec 进新版脚本 —— exec 一次性载入，之后文件再变也没影响。
+set -euo pipefail
+SRC=/opt/xueqiu-mcp/.src
+git -C "$SRC" fetch -q --prune origin main
+git -C "$SRC" reset -q --hard origin/main
+exec bash "$SRC/deploy/deploy.sh"

@@ -1,0 +1,11 @@
+[Unit]
+Description=每 5 分钟检查一次 xueqiu-mcp 是否有新提交
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# 关机期间错过的执行开机后补一次，免得重启完停在旧版本上
+Persistent=true
+
+[Install]
+WantedBy=timers.target
