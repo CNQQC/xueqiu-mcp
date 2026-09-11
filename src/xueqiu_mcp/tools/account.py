@@ -7,9 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
-from .. import auth
+from mcp.types import CallToolResult, ImageContent, TextContent
+
+from .. import auth, login_flow
 from ..client import get_client
 from ..formatting import fmt_count
 
@@ -38,6 +41,12 @@ def _render_user(user: dict) -> str:
 async def login_status() -> str:
     client = get_client()
     if not client.has_user_cookie:
+        attempt = login_flow.get_flow().attempt
+        if attempt and attempt.state == "pending" and not attempt.done.is_set():
+            state = login_flow.get_flow().lookup(attempt.token)
+            if state["state"] == "pending":
+                link = f"\n[打开雪球登录页]({attempt.login_url})" if attempt.login_url else ""
+                return f"正在等待登录。{attempt.message}{link}\n扫码后凭证会自动接管，无需再次取码。"
         return (
             "当前为**匿名模式**。\n"
             "行情、K 线、财务、选股器等公开数据都能正常使用；"
@@ -67,6 +76,7 @@ async def login_with_cookie(cookie: str, remember: bool = True) -> str:
             "请确认浏览器里确实处于登录状态，并复制**完整**的 Cookie 请求头，不要只截取其中几项。"
         )
 
+    await login_flow.get_flow().cancel()
     client = get_client()
     before = client.user_cookie  # 校验失败时回滚，避免把好凭证换成坏的
     before_source = client.cookie_source
@@ -91,6 +101,8 @@ async def login_with_cookie(cookie: str, remember: bool = True) -> str:
 
 
 async def logout(forget: bool = True) -> str:
+    # 先停后台扫码，避免退出后 watcher 又把同一份 Cookie 接管回来。
+    await login_flow.aclose()
     client = get_client()
     had = client.has_user_cookie
     client.clear_user_cookie()
@@ -99,6 +111,11 @@ async def logout(forget: bool = True) -> str:
     parts = ["已退出登录，后续请求回到匿名模式。" if had else "当前本来就没有登录凭证。"]
     if forget:
         parts.append(f"凭证文件已删除（{auth.store_path()}）。" if removed else "凭证文件本来就不存在。")
+        # 浏览器 profile 是独立的第二份登录态，不一起清的话下次扫码会「自动登录」
+        from .. import browser
+
+        if await browser.forget_profile():
+            parts.append("本地浏览器的登录态也一并清除了。")
     else:
         parts.append("凭证文件保留，下次启动会自动读回。")
     if os.getenv("XUEQIU_COOKIE", "").strip():
@@ -110,68 +127,66 @@ async def logout(forget: bool = True) -> str:
 
 
 # ------------------------------------------------------------------ 浏览器登录
-def _qr_block(res: dict) -> str:
-    """把二维码渲染成一段「请原样输出」的说明。
+def _login_result(attempt: login_flow.LoginAttempt) -> CallToolResult:
+    lines = [attempt.message]
+    state = attempt.public_state()
+    if attempt.state == "pending":
+        if attempt.login_url:
+            lines.append(f"[打开雪球登录页]({attempt.login_url})")
+        if attempt.link_note:
+            lines.append(attempt.link_note)
+        lines.append(
+            f"链接剩余 {state['expires_in']} 秒有效。请把链接和二维码图片直接展示给用户。"
+            "后台会自动接管登录态，扫码后可调用 login_status 确认；"
+            "二维码过期时打开链接查看最新图片，或调用 get_login_qrcode(refresh=true)。"
+        )
+    content = [TextContent(type="text", text="\n\n".join(lines))]
+    if attempt.state == "pending" and attempt.qr_data:
+        content.append(ImageContent(type="image", mimeType="image/png",
+                                    data=attempt.qr_data.split(",", 1)[1]))
+    return CallToolResult(
+        content=content,
+        structuredContent={
+            "state": attempt.state, "message": attempt.message,
+            "login_url": attempt.login_url or None,
+            "login_path": attempt.path if attempt.state == "pending" else None,
+            "expires_at": state["expires_at"], "expires_in": state["expires_in"],
+        },
+        isError=attempt.state == "error",
+    )
 
-    字符画被模型改掉一个字符就扫不出来了，所以既明确要求原样输出，又给一份 PNG
-    路径兜底 —— 真被转述坏了，用户还能直接打开图片扫。
-    """
-    lines = [
-        "请用**雪球 App** 扫描下面的二维码登录。",
-        "⚠️ 下面这段字符画请**原样、完整**输出给用户，不要改写、缩排或转述，否则扫不出来：",
-        "",
-        "```",
-        res["qr_text"],
-        "```",
-    ]
-    if res.get("qr_png"):
-        lines.append(f"\n扫不出来就让用户直接打开这张图片：`{res['qr_png']}`")
-    return "\n".join(lines)
+
+async def get_login_qrcode(remember: bool = True, refresh: bool = False) -> CallToolResult:
+    """立即交付扫码图片和临时链接，后台等待登录。"""
+    return await browser_login(remember=remember, refresh=refresh)
 
 
-async def browser_login(mode: str = "qrcode", wait: int = 90, remember: bool = True) -> str:
-    """用本机浏览器登录雪球，成功后登录态自动接管给后续所有请求。"""
+async def browser_login(mode: str = "qrcode", wait: int = 0, remember: bool = True,
+                        refresh: bool = False) -> CallToolResult:
+    """默认立即返回；显式 wait 仅供已经展示过二维码的客户端短暂等待。"""
     from .. import browser
 
     if mode not in ("qrcode", "window"):
-        return "mode 仅支持 qrcode（无头 + 扫码，默认）或 window（弹出窗口自己登录）。"
-
-    session = browser.get_session()
+        return CallToolResult(content=[TextContent(type="text", text=
+            "mode 仅支持 qrcode（无头 + 扫码，默认）或 window（弹出窗口自己登录）。")])
     try:
-        res = await session.open_login(mode)
+        attempt = await login_flow.get_flow().start(mode, remember, refresh)
     except browser.BrowserUnavailable as exc:
-        return f"无法启动本地浏览器：\n\n{exc}"
-
-    # profile 里还留着上次的登录态，直接接管，不用再扫一次
-    if res["logged_in"]:
-        await session.adopt_cookies(remember)
-        return "浏览器里已经是登录状态，登录态已接管 ✅\n\n" + await login_status()
-
-    if mode == "qrcode" and not res.get("qr_text"):
-        return (
-            "登录页打开了，但没读出二维码（雪球页面结构可能变了）。\n"
-            '请改用窗口模式：browser_login(mode="window")，在弹出的浏览器里自己完成登录。'
-        )
-
-    head = _qr_block(res) if mode == "qrcode" else (
-        "已弹出浏览器窗口，请在窗口里完成登录（扫码 / 短信验证码 / 微信都行）。"
-    )
-    jar = await session.wait_login(timeout=max(0, int(wait)))
-    if not jar:
-        return (
-            f"{head}\n\n⏳ 等了 {int(wait)} 秒还没等到登录完成。浏览器仍开着，"
-            "用户扫完码后再调用一次 browser_login 就能接管（不会重新扫码）。"
-        )
-
-    await session.adopt_cookies(remember)
-    tail = "凭证已落盘，重启后仍然有效。" if remember else "仅本次进程有效，未落盘。"
-    return f"登录成功 ✅ {tail}\n\n" + await login_status()
+        return CallToolResult(content=[TextContent(type="text", text=
+            f"无法启动本地浏览器：\n\n{exc}")], isError=True)
+    if wait > 0 and attempt.state == "pending":
+        try:
+            await asyncio.wait_for(attempt.done.wait(), min(int(wait), 30))
+        except asyncio.TimeoutError:
+            pass
+    return _login_result(attempt)
 
 
 async def browser_close() -> str:
     """关掉本机浏览器释放内存。登录态留在 profile 里，不会丢。"""
     from .. import browser
 
+    await login_flow.aclose()
     session = browser.get_session()
     if not session.running:
         return "本地浏览器当前没有运行。"

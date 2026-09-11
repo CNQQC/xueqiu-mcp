@@ -9,6 +9,8 @@ build/
 .idea/
 .vscode/
 .pytest_cache/
+.playwright-cli/
+output/playwright/
 uv.lock
 
 # 登录凭证。默认落在 ~/.xueqiu-mcp/，但 XUEQIU_COOKIE_FILE 可以指到项目目录，

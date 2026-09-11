@@ -51,6 +51,9 @@ CASES: list[tuple[str, dict, list[str]]] = [
     ("login_status", {}, ["登录"]),
     ("login_with_cookie", {"cookie": "foo=bar"}, ["没有登录身份"]),
     ("login_with_cookie", {"cookie": "  "}, ["没能从这串文本里解析"]),
+    # 浏览器登录本身要人扫码，测不了；这里只确认工具注册正确、且没启动时不会抛错
+    ("browser_close", {}, ["浏览器"]),
+    ("browser_login", {"mode": "冒牌模式"}, ["mode 仅支持"]),
 ]
 
 

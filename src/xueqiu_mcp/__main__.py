@@ -4,7 +4,7 @@
 登录相关的子命令：
 
 ==========================  ================================================
-``xueqiu-mcp login``        交互式登录（粘贴 Cookie，或手机号 + 密码）
+``xueqiu-mcp login``        交互式登录（浏览器扫码 / 粘贴 Cookie / 手机号 + 密码）
 ``xueqiu-mcp status``       查看当前登录态
 ``xueqiu-mcp logout``       退出登录并删除本地凭证
 ==========================  ================================================
@@ -60,11 +60,60 @@ async def _finish(jar: dict[str, str], remember: bool) -> int:
     return 0
 
 
+async def _login_via_browser(args: argparse.Namespace) -> int:
+    """本机浏览器登录：无头出二维码，或直接开窗口让用户自己登。"""
+    from . import browser
+
+    session = browser.get_session()
+    try:
+        res = await session.open_login("window" if args.window else "qrcode")
+    except browser.BrowserUnavailable as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        if res["logged_in"]:
+            print("浏览器里已经是登录状态，直接接管。")
+        else:
+            if res.get("qr_text") or res.get("qr_png"):
+                if res.get("qr_text"):
+                    print(res["qr_text"])
+                print("\n请用雪球 App 扫描上面的二维码。", end="")
+                if res.get("qr_png"):
+                    print(f"（扫不出来可以打开 {res['qr_png']}）", end="")
+                print(f"\n最多等 {args.wait} 秒……")
+            elif args.window:
+                print(f"已弹出浏览器窗口，请在窗口里完成登录，最多等 {args.wait} 秒……")
+            else:
+                print(
+                    "❌ 没读出二维码（雪球页面结构可能变了）。\n"
+                    "   请改用窗口模式：xueqiu-mcp login --browser --window",
+                    file=sys.stderr,
+                )
+                return 1
+            if not await session.wait_login(timeout=args.wait):
+                print("❌ 等待超时，没检测到登录完成。", file=sys.stderr)
+                return 1
+
+        jar = await session.cookies()
+    finally:
+        await session.close()
+    return await _finish(jar, not args.no_save)
+
+
 async def _cmd_login(args: argparse.Namespace) -> int:
     mode = args.mode
     if mode is None:
-        print("选择登录方式：\n  1) 粘贴浏览器 Cookie（推荐，最稳）\n  2) 手机号 + 密码（实验性，可能被风控拦）")
-        mode = "password" if input("请输入 1 或 2 [1]> ").strip() == "2" else "cookie"
+        print(
+            "选择登录方式：\n"
+            "  1) 本机浏览器扫码（推荐，用雪球 App 扫一下就完事）\n"
+            "  2) 粘贴浏览器 Cookie（不想装浏览器时用这个）\n"
+            "  3) 手机号 + 密码（实验性，可能被风控拦）"
+        )
+        mode = {"2": "cookie", "3": "password"}.get(input("请输入 1 / 2 / 3 [1]> ").strip(), "browser")
+
+    if mode == "browser":
+        return await _login_via_browser(args)
 
     if mode == "cookie":
         jar = auth.parse_cookie_string(_read_cookie(args.cookie))
@@ -120,6 +169,11 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--cookie", nargs="?", const="", metavar="COOKIE",
                    help="Cookie 串；写 - 表示从标准输入读，省略值则交互式输入")
     g.add_argument("--phone", metavar="手机号", help="手机号密码登录（密码交互式输入，不回显）")
+    g.add_argument("--browser", action="store_true",
+                   help="本机浏览器登录：终端显示二维码，用雪球 App 扫（需要 Playwright）")
+    lg.add_argument("--window", action="store_true",
+                   help="配合 --browser：弹出浏览器窗口自己登录，短信 / 微信 / 滑块都能用")
+    lg.add_argument("--wait", type=int, default=180, help="配合 --browser：等待登录的秒数，默认 180")
     lg.add_argument("--areacode", default="86", help="手机号区号，默认 86")
     lg.add_argument("--no-save", action="store_true", help="只校验不落盘")
 
@@ -147,7 +201,12 @@ def main() -> None:
 
     if args.cmd == "login":
         # --cookie 与 --phone 互斥，没给就走交互式菜单
-        args.mode = "password" if args.phone else ("cookie" if args.cookie is not None else None)
+        args.mode = (
+            "browser" if args.browser
+            else "password" if args.phone
+            else "cookie" if args.cookie is not None
+            else None
+        )
         code = asyncio.run(_cmd_login(args))
     elif args.cmd == "logout":
         code = asyncio.run(_cmd_logout(args))

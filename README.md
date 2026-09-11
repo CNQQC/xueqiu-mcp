@@ -4,7 +4,7 @@
 
 把[雪球](https://xueqiu.com)的行情、财务、资金与**社区论坛**数据接入任何支持 MCP 的客户端（Claude Code、Claude Desktop、Cherry Studio 等）。
 
-覆盖 **A 股 / 港股 / 美股**，外加指数、ETF、可转债。共 **25 个工具**。
+覆盖 **A 股 / 港股 / 美股**，外加指数、ETF、可转债。共 **28 个工具**。
 
 ## 特点
 
@@ -13,6 +13,7 @@
 - **论坛可用**：社区接口在 `xueqiu.com` 主域会被风控拦截，本项目走雪球 App 使用的 `api.xueqiu.com`，**无需登录即可**读取个股讨论、公告新闻、热帖、评论。帖子正文的 HTML 会清洗成纯文本。
 - **免配置**：匿名令牌自动获取与续期，装完即用，不需要 Cookie、不需要注册。
 - **需要时可以登录**：`xueqiu-mcp login` 一条命令，或直接让模型调 `login_with_cookie`。凭证加密权限保存在本地，重启后仍然有效，随时可以 `logout` 撤销。详见[登录](#登录)。
+- **扫码登录，不用碰 Cookie**：装上可选的本地浏览器支持后，`get_login_qrcode` 立即返回二维码图片和临时登录网页链接，用雪球 App 扫码并确认后，后台自动接管凭证。网页会更新二维码和登录结果，适用于本地和远程 MCP。详见[本地浏览器](#本地浏览器)。
 - **选股指标实时同步**：选股器的指标清单直接读雪球官方元数据接口，雪球调整指标不会导致本项目过时。
 - **能在小机器上扛并发**：分级 TTL 缓存 + 并发请求合并 + HTTP/2 多路复用。真实环境实测重复查询快 15.8 倍、打向雪球的请求减少 90%，常驻内存约 75MB。详见[性能与并发](#性能与并发)。
 
@@ -22,11 +23,21 @@
 uv venv --python 3.12 && uv pip install -e .
 ```
 
+MCP SDK 要求 `>=1.30,<3`，支持 1.30 和 2.x 的原生图片返回；从旧版本更新后请重新安装依赖并重启服务。
+
 大 JSON（如 500 根 K 线）的解析想再快 2~3 倍，可以带上 `orjson`：
 
 ```bash
 uv pip install -e ".[fast]"
 ```
+
+想用扫码登录（以及正文的浏览器兜底），再装本地浏览器支持：
+
+```bash
+uv pip install -e ".[browser]" && .venv/bin/playwright install chromium
+```
+
+Chromium 内核约 150MB，不装也不影响其余工具 —— 只是登录得手动贴 Cookie。
 
 ## 接入 Claude Code
 
@@ -119,8 +130,11 @@ macOS 可以直接跑安装脚本。它会自动等 Claude 完全退出（运行
 | 工具 | 说明 |
 | --- | --- |
 | `login_status` | 当前是匿名还是已登录，登录的是哪个账号 |
+| `get_login_qrcode` | 立即返回登录二维码图片和临时网页链接，后台等待扫码（需装浏览器支持） |
+| `browser_login` | 默认同上；也可弹出浏览器窗口完成短信或滑块验证 |
 | `login_with_cookie` | 用浏览器 Cookie 登录，可选择是否保存到本地 |
 | `logout` | 退出登录，回到匿名模式 |
+| `browser_close` | 关掉本机浏览器释放内存，登录态保留 |
 
 ## 代码写法
 
@@ -159,15 +173,31 @@ filters="pettm:0~20,dy_l:3~,mc:100000000000~"
 - `xueqiu.com` 主域上受阿里云 WAF 保护的少数接口（匿名访问会拿到挑战页）；
 - 属于账号本身的数据（用户资料详情、自选股等）。
 
-### 方式一：命令行登录（推荐）
+### 方式一：扫码登录（最省事，需装浏览器支持）
+
+直接让模型调 `get_login_qrcode`：取到二维码后立即返回 **MCP 原生图片**和 **5 分钟有效的登录网页链接**，服务端在后台等待扫码。用雪球 App 扫码并确认后，凭证自动交给后续请求；可用 `login_status` 确认。
+
+重复取码会复用有效会话，`get_login_qrcode(refresh=true)` 才会重新生成并让旧链接失效。旧工具 `browser_login` 同样默认立即返回。
+
+也可以在命令行执行：
+
+```bash
+.venv/bin/xueqiu-mcp login --browser
+```
+
+终端会直接画出二维码，用**雪球 App** 扫一下就完成登录，全程不碰 Cookie。
+扫不出来可以打开它同时存下的 `~/.xueqiu-mcp/login-qrcode.png`，或者换成窗口模式
+`--browser --window` —— 弹出真浏览器，短信验证码、微信登录、滑块验证都能在里面做完。
+
+### 方式二：命令行登录
 
 ```bash
 .venv/bin/xueqiu-mcp login
 ```
 
-按提示二选一：
+按提示选择：
 
-1. **粘贴浏览器 Cookie**（最稳）：浏览器登录 xueqiu.com → 开发者工具 → Network →
+1. **粘贴浏览器 Cookie**（不想装浏览器时用这个）：浏览器登录 xueqiu.com → 开发者工具 → Network →
    任意请求的 `Cookie` 请求头 → 复制**整串**。滑块、短信、设备校验全部由浏览器完成，
    本程序只接手结果。
 2. **手机号 + 密码**（实验性）：密码用 `getpass` 读取，不回显、不进 shell 历史。
@@ -188,7 +218,7 @@ pbpaste | .venv/bin/xueqiu-mcp login --cookie -
 原子写入），MCP Server 启动时自动读取，**不需要改任何客户端配置**。
 换个位置存放：设 `XUEQIU_COOKIE_FILE`。
 
-### 方式二：让模型引导你登录
+### 方式三：让模型引导你登录
 
 **不需要你先知道要登录。** 任何工具一旦因为没有登录态而失败，返回给模型的报错里会
 直接附上完整的登录步骤（去哪复制 Cookie、复制哪一行、之后调哪个工具），模型照着念
@@ -203,7 +233,7 @@ pbpaste | .venv/bin/xueqiu-mcp login --cookie -
 > 密码登录**不提供** MCP 工具：工具入参会完整进入模型上下文和客户端日志，密码不该
 > 走这条路。要用密码请走上面的命令行。
 
-### 方式三：环境变量
+### 方式四：环境变量
 
 适合容器 / 服务器部署，一次性注入、不落盘：
 
@@ -220,6 +250,85 @@ pbpaste | .venv/bin/xueqiu-mcp login --cookie -
 
 优先级：`XUEQIU_COOKIE` 环境变量 > 本地凭证文件。环境变量优先，是为了让部署时注入的
 凭证能盖住机器上残留的登录态。
+
+## 本地浏览器
+
+可选能力，装了才有：
+
+```bash
+uv pip install -e ".[browser]" && .venv/bin/playwright install chromium
+```
+
+它在本机跑一个独立的 Chromium（不碰你日常用的浏览器），干两件事。
+
+### 一、扫码登录
+
+`get_login_qrcode` 打开独立的雪球登录标签页，切到二维码登录，直接把 canvas 导出为
+PNG，以 MCP 图片内容返回，同时给出临时登录网页链接。无需模型复制字符画，也无需
+客户端访问服务器上的图片文件。登录页面与正文渲染页面分开，查询帖子不会打断扫码。
+
+后台每 2 秒检查登录状态和二维码；页面提示二维码失效时点击刷新。网页也会轮询更新，
+登录成功后收起二维码、显示结果。凭证默认写入 `~/.xueqiu-mcp/cookies.json`（0600）。
+`remember=false` 只禁止写入该文件，浏览器自身仍使用持久化 profile。
+
+会话最多等待 5 分钟，完成、超时、重新取码、`browser_close` 或 `logout` 都会清理等待任务
+和登录标签页。`browser_login(wait=...)` 可显式等待，单次上限 30 秒；第一次应保持默认
+`wait=0`，让用户先看到二维码。短信、微信或滑块验证可使用 `browser_login(mode="window")`
+在服务所在机器弹出的窗口里操作。
+
+**本地 stdio 接入**：自动启动只监听 `127.0.0.1` 的临时网页服务，使用系统分配的端口。
+链接只能在运行 MCP 的机器上打开；手机可扫描对话中的二维码。服务随 MCP 退出关闭，
+`browser_close` / `logout` 也会关闭临时网页服务。
+
+**远程 HTTP / SSE 接入**：网页与 MCP 共用服务端口，配置服务对外的基础地址，例如：
+
+```bash
+XUEQIU_TRANSPORT=streamable-http
+XUEQIU_PUBLIC_BASE_URL=https://mcp.example.com/xueqiu
+```
+
+这样返回的链接为 `https://mcp.example.com/xueqiu/login/<随机token>`。反向代理需要把
+`/xueqiu/login/<token>` 和 `/xueqiu/login/<token>/state` 转到服务的 `/login/...` 路由。
+这两条只读路由用短期随机 token 授权，不附带 MCP 的长期 Bearer 凭证；如果代理统一鉴权，
+请仅为这两种 GET 路径放行，继续保护 `/mcp`。建议关闭登录路径的访问日志，避免记录 token。
+未配置公网地址时仍返回二维码和相对路径，不会猜一个无法访问的公网链接。
+
+扫码会话存在内存中、同一进程共享一个雪球账号。使用一个 worker，或将同一登录会话的
+MCP 请求和网页请求固定转发给同一进程；进程重启会让旧链接失效。服务器若使用自定义
+`serve_http.py`，也应设置 `XUEQIU_TRANSPORT=streamable-http`，并使用本项目注册的 HTTP app。
+
+命令行 `xueqiu-mcp login --browser` 继续支持终端字符二维码和本地 PNG 文件。
+
+### 二、正文兜底
+
+`get_post` 发现正文残缺时（雪球把 `truncated` 置位，或正文整个为空），会开页面从
+`window.SNOWMAN_STATUS` 里把完整正文捞回来。
+
+> **实测说明**：匿名状态下 `/statuses/show.json` 对普通帖子和长文都给得**全** ——
+> 抽查 7 篇带标题的长文，API 正文与页面渲染结果逐字一致（1.0x）。所以这条兜底
+> 平时不会触发，它兜的是付费专栏、仅粉丝可见这类匿名拿不到全文的少数内容。
+> 列表接口（讨论区 / 热帖 / 搜帖）里那一两百字确实是摘要，但对着帖子 ID 调
+> `get_post` 就能拿到全文，不需要浏览器。
+
+### 资源与开关
+
+浏览器常驻约 200MB，远高于本项目其余部分（约 75MB），所以**空闲 5 分钟自动关闭**，
+下次要用再拉起来；也可以随时 `browser_close` 手动关。登录态在 profile 目录里，
+关掉不会丢。
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `XUEQIU_BROWSER` | 1 | 设 0 彻底关掉浏览器能力（连装了也不用） |
+| `XUEQIU_BROWSER_HEADLESS` | 1 | 设 0 则扫码模式也开窗口，方便排查页面问题 |
+| `XUEQIU_BROWSER_PROFILE` | `~/.xueqiu-mcp/browser` | profile 目录，登录态存在这里 |
+| `XUEQIU_BROWSER_IDLE` | 300 | 空闲多少秒后自动关闭，设 0 关掉这个回收 |
+| `XUEQIU_BROWSER_TIMEOUT` | 30 | 单个页面操作的超时（秒） |
+| `XUEQIU_PUBLIC_BASE_URL` | 空 | 远程登录网页的对外基础地址，可带反向代理路径前缀 |
+
+profile 是独立于 `cookies.json` 的第二份登录态，所以 `logout` 会把它一起清掉 ——
+否则下次扫码会「莫名其妙」直接登录成功。
+
+> 无图形界面的服务器一样能用扫码登录：二维码是纯文本，`window` 模式才需要 GUI。
 
 ## 部署到服务器
 
@@ -307,14 +416,21 @@ MOCK_RTT=0 .venv/bin/python tests/bench.py # 零延迟，放大纯代码开销
 .venv/bin/python tests/test_mcp_e2e.py   # 端到端，需要联网
 .venv/bin/python tests/test_cache.py     # 缓存层，零网络
 .venv/bin/python tests/test_auth.py      # 登录与凭证，零网络
+.venv/bin/python tests/test_browser.py   # 本地浏览器层，零网络、不启动浏览器
+.venv/bin/python tests/test_login_flow.py # 扫码会话、网页、MCP 原生图片契约，假浏览器
 ```
 
 `test_mcp_e2e.py` 会以真正的 MCP 客户端身份通过 stdio 连接本 Server，列出全部工具
 并逐个实调（含中文名解析、指数/ETF/可转债、以及各类参数校验的错误提示），最后打印
 通过数；它只测不改变登录态的账号路径，不会把跑测试的人踢下线。
-`test_auth.py` 会把凭证文件指向临时目录，不碰 `~/.xueqiu-mcp/`。
+`test_auth.py` 与 `test_browser.py` 会把凭证文件和浏览器 profile 都指向临时目录，
+不碰 `~/.xueqiu-mcp/`。`test_browser.py` 不启动浏览器，只覆盖二维码矩阵怎么变成能扫
+的字符画、什么时候判定正文残缺、以及没装 Playwright 时会不会把 `get_post` 拖垮。
 
-CI 上跑的是两个零网络用例（Python 3.10~3.13，外加一轮装了 orjson 的）。端到端测试
+`test_login_flow.py` 验证后台保存凭证、链接失效、取消与刷新、网页响应，以及真实 stdio
+通信中的图片与结构化结果；只监听本机临时端口，不访问雪球，不需要安装 Playwright。
+
+CI 上跑上述四组离线测试（Python 3.10~3.13，外加 orjson 和 MCP 1.30 兼容性检查）。端到端测试
 放在[单独的每周巡检](.github/workflows/e2e-weekly.yml)里，不卡合并 —— 它红了说明
 雪球那边变了，而不是这次改动坏了。
 
@@ -328,6 +444,8 @@ IP 返回空结果**；该条在 CI 里记为跳过（`XUEQIU_E2E_GEO_TOLERANT=1
 src/xueqiu_mcp/
 ├── client.py        HTTP 客户端：令牌续期、连接池与 HTTP/2、并发闸门、风控识别
 ├── auth.py          登录：Cookie 解析与登录态识别、凭证落盘、密码登录
+├── browser.py       本地浏览器：扫码登录、正文兜底渲染、profile 与空闲回收
+├── login_flow.py    临时登录链接、后台扫码会话与登录网页
 ├── cache.py         响应缓存：分级 TTL、LRU 内存上限、并发请求合并
 ├── symbols.py       代码规范化（600519 → SH600519）
 ├── resolve.py       代码解析，中文名走搜索兜底
@@ -343,7 +461,7 @@ src/xueqiu_mcp/
     ├── capital.py   资金流、两融、大宗交易
     ├── market.py    选股器、行业、人气榜
     ├── social.py    论坛：讨论、公告新闻、热帖、评论
-    └── account.py   账号：登录状态、Cookie 登录、退出登录
+    └── account.py   账号：登录状态、扫码登录、Cookie 登录、退出登录
 ```
 
 ## 说明

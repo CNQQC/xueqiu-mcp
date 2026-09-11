@@ -11,11 +11,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+from mcp.types import CallToolResult
+
 try:  # mcp >= 2.0
     from mcp.server import MCPServer as _Server
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server
 
+from . import browser, login_flow
 from .client import get_client
 from .tools import account, capital, f10, finance, quote, social
 from .tools import market as market_tools
@@ -37,23 +40,36 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
 
 关于登录：少数受风控保护的社区接口和账号相关数据需要登录。任何工具一旦因为未登录
-而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，引导
-用户拿到浏览器 Cookie 后交给你，再由你调用 login_with_cookie 完成登录，不要只回一句
-「需要登录」就停下。不确定当前登录态时，用 login_status 查。"""
+而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，不要
+只回一句「需要登录」就停下。首选 get_login_qrcode（立即返回二维码图片和临时登录链接，
+请把图片和链接直接展示给用户，用户用雪球 App 扫码后后台会自动保存凭证）；不要先等待
+用户扫码再展示图片。网页会更新二维码和登录结果。那台机器没装浏览器支持时，
+再引导用户复制浏览器 Cookie 交给你，由你调用 login_with_cookie。不确定当前登录态时，
+用 login_status 查。
+
+另外，讨论区 / 热帖 / 搜帖这些列表接口只给一两百字的摘要，要读全文就对着帖子 ID 调
+get_post —— 它取的是完整正文，正文残缺时还会用本机浏览器补一次。所以别因为列表里只有
+摘要就下结论，先 get_post。"""
 
 @asynccontextmanager
 async def _lifespan(_server):
-    """进程退出时收好 HTTP 连接池，http 模式下同样有效。"""
+    """进程退出时收好 HTTP 连接池和本地浏览器，http 模式下同样有效。"""
     try:
         yield {}
     finally:
+        await login_flow.aclose()
         await get_client().aclose()
+        await browser.aclose()
 
 
 try:
     mcp = _Server("xueqiu", instructions=INSTRUCTIONS, lifespan=_lifespan)
 except TypeError:  # 老版 mcp 不支持 lifespan
     mcp = _Server("xueqiu", instructions=INSTRUCTIONS)
+
+# 短期随机 token 是这两条只读路由的访问凭证，页面不返回账号 Cookie。
+mcp.custom_route("/login/{token}", methods=["GET"])(login_flow.login_page)
+mcp.custom_route("/login/{token}/state", methods=["GET"])(login_flow.login_state)
 
 
 # ------------------------------------------------------------------ 搜索与行情
@@ -340,15 +356,21 @@ async def search_posts(query: str, count: int = 10, page: int = 1) -> str:
 
 
 @mcp.tool()
-async def get_post(post_id: str, with_comments: bool = True, comment_count: int = 10) -> str:
+async def get_post(
+    post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True
+) -> str:
     """按帖子 ID 取全文及热门评论。ID 可从讨论列表或热帖列表中获得。
+
+    正文残缺时（雪球置了 truncated，或正文为空的付费 / 仅粉丝可见内容）会用本机
+    浏览器把完整正文取回来，需要装浏览器支持，没装就照常返回并给出提示。
 
     Args:
         post_id: 帖子数字 ID，或完整帖子链接
         with_comments: 是否附带评论
         comment_count: 评论条数，最多 30
+        full_text: 正文被截断时是否用本地浏览器补全；设 false 可省掉这次开销
     """
-    return await social.get_post(post_id, with_comments, comment_count)
+    return await social.get_post(post_id, with_comments, comment_count, full_text)
 
 
 @mcp.tool()
@@ -401,6 +423,52 @@ async def logout(forget: bool = True) -> str:
     return await account.logout(forget)
 
 
+@mcp.tool()
+async def get_login_qrcode(remember: bool = True, refresh: bool = False) -> CallToolResult:
+    """获取雪球登录二维码图片和临时登录网页链接，取码后立即返回，不等待扫码。
+
+    首选登录方式。请直接展示返回的图片和链接，用户用雪球 App 扫码并确认后，后台
+    自动接管凭证。链接 5 分钟有效，页面更新二维码和结果；用 login_status 确认登录。
+    重复调用复用有效会话，避免打断正在扫码的用户。
+
+    Args:
+        remember: 是否保存到 cookies.json；浏览器自身仍使用持久化 profile
+        refresh: 为 true 时取消旧登录会话并生成新二维码及链接
+    """
+    return await account.get_login_qrcode(remember, refresh)
+
+
+@mcp.tool()
+async def browser_login(mode: str = "qrcode", wait: int = 0, remember: bool = True,
+                        refresh: bool = False) -> CallToolResult:
+    """通过浏览器登录雪球，默认立即返回二维码图片和临时链接，后台等待扫码。
+
+    Args:
+        mode: qrcode 无头模式显示二维码（默认）；window 弹出浏览器窗口自己登录，
+              短信验证码、微信登录、滑块验证都能在窗口里完成
+        wait: 默认 0 立即交付；已展示二维码后可显式等待，单次最多 30 秒
+        remember: 是否保存到 cookies.json；浏览器自身仍使用持久化 profile
+        refresh: 是否取消已有扫码会话并重新取码，默认复用有效会话
+    """
+    return await account.browser_login(mode, wait, remember, refresh)
+
+
+@mcp.tool()
+async def browser_close() -> str:
+    """关掉本机浏览器释放内存（约 200MB）。登录态保留，下次需要时会自动拉起。"""
+    return await account.browser_close()
+
+
+def _run_http(transport: str, **options) -> None:
+    # 1.x 从 settings 读监听配置；2.x 改为 run() 参数。
+    if hasattr(mcp.settings, "host"):
+        for name, value in options.items():
+            setattr(mcp.settings, name, value)
+        mcp.run(transport)
+    else:
+        mcp.run(transport, **options)
+
+
 def run() -> None:
     """启动 MCP Server。
 
@@ -422,7 +490,7 @@ def run() -> None:
         port = int(os.getenv("XUEQIU_PORT", "8000"))
         stateless = os.getenv("XUEQIU_STATELESS", "1").strip().lower() not in ("0", "false", "no", "off")
         log.info("以 streamable-http 启动：http://%s:%s/mcp（stateless=%s）", host, port, stateless)
-        mcp.run(
+        _run_http(
             "streamable-http",
             host=host,
             port=port,
@@ -430,6 +498,7 @@ def run() -> None:
             json_response=True,  # 纯请求-响应型工具，不需要 SSE 流式开销
         )
     elif transport == "sse":
-        mcp.run("sse", host=os.getenv("XUEQIU_HOST", "127.0.0.1"), port=int(os.getenv("XUEQIU_PORT", "8000")))
+        _run_http("sse", host=os.getenv("XUEQIU_HOST", "127.0.0.1"),
+                  port=int(os.getenv("XUEQIU_PORT", "8000")))
     else:
         mcp.run()

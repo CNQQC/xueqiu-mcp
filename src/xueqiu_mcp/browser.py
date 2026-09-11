@@ -4,11 +4,12 @@
 ----------------
 雪球的数据有两处是纯 HTTP 客户端够不着的：
 
-**长文正文被截断**
-    ``api.xueqiu.com`` 对长帖匿名返回的 ``description`` 只有一两百字的摘要，
-    完整的 ``text`` 要么缺失、要么被 ``truncated`` 标记。实测同一篇帖子：
-    匿名 API 给 170 字，浏览器渲染后页面里的 ``window.SNOWMAN_STATUS.text``
-    有 6938 字 —— 差了 40 倍。
+**正文残缺的少数帖子**
+    列表类接口（讨论区、热帖、搜帖）只给一两百字的 ``description`` 摘要，正文要
+    靠 ``/statuses/show.json`` 再取一次。实测匿名下 show.json 对普通帖子和长文都
+    给得全（抽查 7 篇长文，与页面渲染结果逐字一致），所以**这条路平时不触发**；
+    它兜的是 ``truncated`` 被置位、或正文整个为空的少数帖子 —— 付费专栏、仅粉丝
+    可见这类内容匿名拿不到全文，登录后从页面上却能读到。
 
 **主域接口被 WAF 拦**
     ``xueqiu.com`` 主域挂着阿里云 WAF 的 JS 挑战，匿名 httpx 请求拿回来的是挑战
@@ -16,7 +17,8 @@
 
 所以本模块做两件事：把浏览器当**登录器**（扫码 / 短信 / 微信都由用户在真浏览器里
 完成，程序只接手结果 cookie），以及当**兜底渲染器**（只在 API 明显没给全时才开
-页面）。日常取数仍然走 :mod:`.client` 的 httpx 快路径。
+页面）。两者里前者是主角 —— 登录态本身才是拿到受限内容的钥匙，渲染只是最后一道
+保险。日常取数仍然走 :mod:`.client` 的 httpx 快路径。
 
 页面里的数据从哪读
 ------------------
@@ -43,6 +45,7 @@ chromium``）。没装时本模块的入口会抛 :class:`BrowserUnavailable`，
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -54,12 +57,14 @@ from . import auth
 log = logging.getLogger("xueqiu_mcp")
 
 HOME_URL = "https://xueqiu.com"
+# 帖子页只认 /{uid}/{pid} 这一种写法：/statuses/show/{pid} 会吃 404，
+# 所以缺 uid 时得先花一次轻量 API 把作者查出来（见 :meth:`BrowserSession.fetch_status`）
 POST_URL = "https://xueqiu.com/{uid}/{pid}"
-# 帖子页可以只用 pid 访问，雪球会 302 到带 uid 的规范地址
-SHORT_POST_URL = "https://xueqiu.com/statuses/show/{pid}"
 
 # 二维码登录的画布。class 带构建 hash，只能前缀匹配
 QRCODE_CANVAS = '[class*="index_qrcode__wrapper"] canvas'
+# 「二维码登录」这个 tab 是 React 渲染的，domcontentloaded 时往往还不存在
+QRCODE_TAB = "text=二维码登录"
 DEFAULT_IDLE = 300.0
 
 
@@ -200,6 +205,8 @@ class BrowserSession:
         self._pw: Any = None
         self._ctx: Any = None
         self._page: Any = None
+        self._login_page: Any = None
+        self._headless: bool | None = None
         self._lock = asyncio.Lock()
         self._last_used = 0.0
         self._reaper: asyncio.Task | None = None
@@ -213,6 +220,8 @@ class BrowserSession:
         """确保浏览器已启动，返回可用的 page。"""
         if not available():
             raise BrowserUnavailable(INSTALL_HINT)
+        if self._ctx is not None and headless is not None and headless != self._headless:
+            await self._teardown()
         if self._ctx is not None:
             self._touch()
             return self._page
@@ -244,6 +253,7 @@ class BrowserSession:
             raise BrowserUnavailable(f"启动 Chromium 失败：{exc}\n\n{INSTALL_HINT}") from exc
 
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
+        self._headless = headless
         self._page.set_default_timeout(float(os.getenv("XUEQIU_BROWSER_TIMEOUT", "30")) * 1000)
         self._touch()
         self._start_reaper()
@@ -269,6 +279,9 @@ class BrowserSession:
         self._reaper = asyncio.create_task(reap())
 
     async def _teardown(self) -> None:
+        reaper, self._reaper = self._reaper, None
+        if reaper is not None and reaper is not asyncio.current_task():
+            reaper.cancel()
         for obj, name in ((self._ctx, "close"), (self._pw, "stop")):
             if obj is not None:
                 try:
@@ -276,6 +289,8 @@ class BrowserSession:
                 except Exception:  # 关闭失败没什么可补救的，别把它抛给调用方
                     pass
         self._ctx = self._pw = self._page = None
+        self._login_page = None
+        self._headless = None
 
     async def close(self) -> None:
         async with self._lock:
@@ -285,7 +300,11 @@ class BrowserSession:
     async def cookies(self) -> dict[str, str]:
         if self._ctx is None:
             return {}
-        return {c["name"]: c["value"] for c in await self._ctx.cookies()}
+        return {
+            c["name"]: c["value"] for c in await self._ctx.cookies()
+            if c.get("domain", "").lstrip(".") == "xueqiu.com"
+            or c.get("domain", "").endswith(".xueqiu.com")
+        }
 
     async def adopt_cookies(self, remember: bool = True) -> dict[str, str]:
         """把浏览器里的登录 cookie 交给 httpx 客户端，并按需落盘。
@@ -314,20 +333,30 @@ class BrowserSession:
 
     # ------------------------------------------------------------- 登录
     async def open_login(self, mode: str = "qrcode") -> dict[str, Any]:
-        """打开登录页，返回 ``{"logged_in", "qr_text", "qr_png"}``。
+        """打开独立登录标签页，返回 PNG data URI、文件路径和终端字符画。
 
-        ``mode="qrcode"`` 走无头 + 二维码：二维码同时以终端字符和 PNG 两种形式给
-        出 —— 字符版方便直接显示在对话里，PNG 版是兜底（模型转述字符画有可能把
-        它弄坏，扫不出来时让用户打开图片文件）。
-
-        ``mode="window"`` 弹出真实浏览器窗口，扫码 / 短信 / 微信随用户选，程序只
-        负责在旁边轮询等结果。滑块、设备校验这些也一并由浏览器处理掉了。
+        登录页与正文渲染页分开，取帖子不会打断正在进行的扫码。
         """
-        headless = mode == "qrcode" and _env_flag("XUEQIU_BROWSER_HEADLESS", True)
-        page = await self._ensure(headless=headless)
-        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        async with self._lock:
+            return await self._open_login(mode)
 
-        out: dict[str, Any] = {"logged_in": False, "qr_text": None, "qr_png": None}
+    async def _open_login(self, mode: str) -> dict[str, Any]:
+        headless = mode == "qrcode" and _env_flag("XUEQIU_BROWSER_HEADLESS", True)
+        await self._ensure(headless=headless)
+        if self._login_page is None or self._login_page.is_closed():
+            self._login_page = await self._ctx.new_page()
+            self._login_page.set_default_timeout(
+                float(os.getenv("XUEQIU_BROWSER_TIMEOUT", "30")) * 1000
+            )
+        page = self._login_page
+        try:
+            await page.goto(HOME_URL, wait_until="domcontentloaded")
+        except Exception as exc:
+            raise BrowserUnavailable("雪球登录页打开失败，请稍后重试。") from exc
+
+        out: dict[str, Any] = {
+            "logged_in": False, "qr_text": None, "qr_png": None, "qr_data": None,
+        }
         if auth.is_logged_in(await self.cookies()):
             out["logged_in"] = True
             return out
@@ -335,49 +364,107 @@ class BrowserSession:
             return out
 
         try:
+            # 先等 React 把登录卡片渲染出来。少了这一步，evaluate 点了个空气，
+            # 后面就只能干等 canvas 超时（实测 domcontentloaded 后还要 1~3 秒）
+            await page.wait_for_selector(QRCODE_TAB, state="attached", timeout=20000)
             await page.evaluate(_SWITCH_QR_JS)
-            await page.wait_for_selector(QRCODE_CANVAS, timeout=15000)
+            # canvas 读的是像素，不要求可见，attached 就够
+            await page.wait_for_selector(QRCODE_CANVAS, state="attached", timeout=15000)
             # canvas 是 JS 画的，选择器命中时可能还没画完，给它一拍
             for _ in range(20):
-                matrix = await page.evaluate(_READ_QR_JS, QRCODE_CANVAS)
-                if matrix:
-                    out["qr_text"] = qr_matrix_to_text(matrix)
-                    out["qr_png"] = await self._save_qr_png(page)
+                qr = await self._read_qr(page, with_text=True)
+                if qr.get("qr_data"):
+                    out.update(qr)
                     break
                 await asyncio.sleep(0.3)
         except Exception as exc:
             log.warning("读取登录二维码失败：%s", exc)
         return out
 
-    async def _save_qr_png(self, page: Any) -> str | None:
-        """把二维码 canvas 另存成 PNG，返回路径。失败返回 ``None``。"""
-        try:
-            data_url = await page.evaluate(
-                "(sel) => { const c = document.querySelector(sel);"
-                " return c ? c.toDataURL('image/png') : null; }",
-                QRCODE_CANVAS,
-            )
-            if not data_url or "," not in data_url:
-                return None
-            import base64
+    async def _read_qr(self, page: Any, with_text: bool = False) -> dict[str, Any]:
+        """PNG 直接从 canvas 导出，不让字符矩阵识别失败影响图片交付。"""
+        out: dict[str, Any] = {}
+        data_url = await page.evaluate(
+            """(sel) => {
+                const c = document.querySelector(sel);
+                if (!c || !c.width || !c.height) return null;
+                const pixels = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                for (let i = 0; i < pixels.length; i += 4) {
+                    if (pixels[i+3] >= 128 && pixels[i]+pixels[i+1]+pixels[i+2] < 384)
+                        return c.toDataURL('image/png');
+                }
+                return null;
+            }""",
+            QRCODE_CANVAS,
+        )
+        if not data_url or not data_url.startswith("data:image/png;base64,"):
+            return out
+        out["qr_data"] = data_url
+        if with_text:
+            try:
+                matrix = await page.evaluate(_READ_QR_JS, QRCODE_CANVAS)
+                if matrix:
+                    out["qr_text"] = qr_matrix_to_text(matrix)
+            except Exception:
+                pass  # MCP 图片交付不依赖终端字符画
+            out["qr_png"] = self._save_qr_png(data_url)
+        return out
 
-            path = profile_dir().parent / "login-qrcode.png"
-            path.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
-            os.chmod(path, 0o600)
+    @staticmethod
+    def _save_qr_png(data_url: str) -> str | None:
+        """另存一份 PNG 给命令行使用；MCP 直接用内存图片。"""
+        try:
+            path = (profile_dir().parent / "login-qrcode.png").resolve()
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(base64.b64decode(data_url.split(",", 1)[1], validate=True))
             return str(path)
         except Exception:
             return None
 
+    async def login_snapshot(self, mode: str = "qrcode") -> dict[str, Any]:
+        """检查同一登录页；页面明确提示二维码失效时才点击换码。"""
+        async with self._lock:
+            if self._ctx is None or self._login_page is None or self._login_page.is_closed():
+                raise BrowserUnavailable("登录浏览器已关闭，请重新调用 get_login_qrcode。")
+            self._touch()
+            if auth.is_logged_in(await self.cookies()):
+                return {"logged_in": True}
+            out: dict[str, Any] = {"logged_in": False}
+            if mode == "qrcode":
+                await self._login_page.evaluate(r"""() => {
+                    const root = document.querySelector('[class*="index_qrcode__wrapper"]');
+                    if (!root || !/失效|过期|刷新二维码/.test(root.innerText)) return;
+                    const target = [...root.querySelectorAll('button,a,span,div')]
+                        .reverse().find(e => /刷新|重试|重新获取/.test(e.textContent)
+                            && e.getClientRects().length);
+                    if (target) target.click();
+                }""")
+                out.update(await self._read_qr(self._login_page))
+            return out
+
+    async def close_login_page(self) -> None:
+        async with self._lock:
+            if self._login_page is not None:
+                try:
+                    await self._login_page.close()
+                except Exception:
+                    pass
+                self._login_page = None
+
     async def wait_login(self, timeout: float = 120.0, poll: float = 2.0) -> dict[str, str]:
         """轮询等待登录完成，返回登录 cookie；超时返回空字典。"""
-        deadline = time.monotonic() + max(1.0, timeout)
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
             jar = await self.cookies()
             if auth.is_logged_in(jar):
                 self._touch()
                 return jar
-            await asyncio.sleep(poll)
-        return {}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {}
+            self._touch()
+            await asyncio.sleep(min(poll, remaining))
 
     async def logout(self) -> bool:
         """清掉浏览器 profile 里的登录态。返回是否清到了东西。"""
@@ -392,16 +479,36 @@ class BrowserSession:
         """渲染帖子页，取回完整的 status 对象。
 
         取的是 ``window.SNOWMAN_STATUS`` —— 和 API 同结构，但 ``text`` 不截断。
+        调用方一般已经从 API 拿到了 ``user_id``，直接传进来能省掉下面那次查询。
         """
+        if not uid:
+            uid = await self._author_of(pid)
         async with self._lock:
             page = await self._ensure()
-            url = POST_URL.format(uid=uid, pid=pid) if uid else SHORT_POST_URL.format(pid=pid)
+            url = POST_URL.format(uid=uid, pid=pid)
             await page.goto(url, wait_until="domcontentloaded")
             st = await page.evaluate("() => window.SNOWMAN_STATUS || null")
             self._touch()
         if not isinstance(st, dict) or not st.get("id"):
             raise BrowserUnavailable(f"页面里没有帖子数据，可能是帖子已删除或需要登录：{url}")
         return st
+
+    @staticmethod
+    async def _author_of(pid: str | int) -> str:
+        """查帖子作者的 uid —— 帖子页 URL 少了它就是 404。
+
+        走轻量 API 而不是搜索页：这一步只为拼出 URL，多花的时间要尽可能少。
+        """
+        from .client import get_client
+
+        data = await get_client().get(
+            "/statuses/show.json", {"id": str(pid)}, base="https://api.xueqiu.com",
+            referer="https://xueqiu.com/",
+        )
+        author = (data or {}).get("user_id") or ((data or {}).get("user") or {}).get("id")
+        if not author:
+            raise BrowserUnavailable(f"查不到帖子 {pid} 的作者，无法拼出帖子页地址。")
+        return str(author)
 
 
 _session: BrowserSession | None = None
@@ -418,3 +525,20 @@ async def aclose() -> None:
     """进程退出时收好浏览器。没启动过就是个空操作。"""
     if _session is not None:
         await _session.close()
+
+
+async def forget_profile() -> bool:
+    """删掉整个浏览器 profile，返回是否真的删掉了东西。
+
+    退出登录时必须连它一起清 —— profile 里的登录态是独立于 cookies.json 的一份，
+    只删凭证文件的话，下次 browser_login 会「莫名其妙」又自动登录上。
+    """
+    import shutil
+
+    if _session is not None:
+        await _session.close()
+    path = profile_dir()
+    if not path.exists():
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return not path.exists()

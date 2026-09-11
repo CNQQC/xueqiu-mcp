@@ -14,7 +14,7 @@ jobs:
   # 零网络测试：缓存层与登录/凭证层。这是唯一卡住合并的门禁 —— 它的红绿只取决于
   # 本仓库的代码，不受雪球接口可用性影响。
   offline:
-    name: 离线测试 (py${{ matrix.python }}${{ matrix.extras && ' + orjson' || '' }})
+    name: 离线测试 (py${{ matrix.python }}${{ matrix.extras && ' + orjson' || '' }} ${{ matrix.mcp }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -25,6 +25,10 @@ jobs:
           # client.py 的 JSON 解析在装了 orjson 时走另一条分支，单独覆盖一次
           - python: "3.12"
             extras: "[fast]"
+          # 同时验证 FastMCP 1.x 的原生图片返回与 HTTP 路由。
+          - python: "3.12"
+            extras: ""
+            mcp: "mcp==1.30.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -35,7 +39,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: 安装
-        run: pip install -e ".${{ matrix.extras }}"
+        run: pip install -e ".${{ matrix.extras }}" ${{ matrix.mcp }}
 
       - name: 导入自检
         # 装完就 import 一次：CI 里最常见的失败是依赖装不上或语法错，
@@ -48,3 +52,10 @@ jobs:
       - name: 登录与凭证测试
         # 该用例会把 XUEQIU_COOKIE_FILE 指向临时目录，不会碰到 ~/.xueqiu-mcp/
         run: python tests/test_auth.py
+
+      - name: 本地浏览器层测试
+        # 不装 Playwright 也要能过：这一层的降级路径本身就是被测对象之一
+        run: python tests/test_browser.py
+
+      - name: 扫码会话与 MCP 图片契约
+        run: python tests/test_login_flow.py
