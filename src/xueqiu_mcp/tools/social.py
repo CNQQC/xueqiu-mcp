@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from ..client import APP_API, get_client
 from ..formatting import fmt_count, fmt_ts, post_url, strip_html
@@ -39,15 +41,52 @@ def _author(st: dict) -> tuple[str, str]:
     return name, tag
 
 
-def _post_body(st: dict, limit: int) -> str:
-    """正文优先取 text，长文可能只有 description 摘要。"""
-    body = strip_html(st.get("text"), limit)
-    if not body:
-        body = strip_html(st.get("description"), limit)
-    return body or "（无正文，可能是图片或视频帖）"
+def _user_id(value: str) -> str:
+    """接受数字 ID 或雪球主页/帖子链接，拒绝昵称及其他站点链接。"""
+    value = str(value).strip()
+    if value.startswith(("https://", "http://")):
+        url = urlparse(value)
+        if url.hostname not in ("xueqiu.com", "www.xueqiu.com"):
+            return ""
+        value = url.path.strip("/").split("/")[0]
+    return str(int(value)) if value.isascii() and value.isdigit() and int(value) > 0 else ""
 
 
-def _render_post(st: dict, idx: int | None = None, body_limit: int = 220) -> str:
+def _is_author(st: dict, uid: str) -> bool:
+    # 不信任上游是否真的应用了 uid；未知作者或互相矛盾的作者字段也不能当作一手来源。
+    ids = [str(v) for v in (st.get("user_id"), (st.get("user") or {}).get("id")) if v is not None]
+    return bool(ids) and all(v == uid for v in ids)
+
+
+def _excerpt(text: str, limit: int | None, query: str = "") -> str:
+    if not limit or len(text) <= limit:
+        return text
+    # 不再一律截开头：长文命中词经常在几千字之后。
+    terms = [query] + query.split() if query else []
+    positions = [text.lower().find(term.lower()) for term in terms if term]
+    matches = [p for p in positions if p >= 0]
+    start = max(0, min(matches) - limit // 3) if matches else 0
+    return ("…" if start else "") + text[start:start + limit] + ("…" if start + limit < len(text) else "")
+
+
+def _post_body(st: dict, limit: int | None, query: str = "") -> str:
+    """将当前作者文字、内联引用、被转发帖分开，避免把他人的观点算给当前作者。"""
+    body = strip_html(st.get("text")) or strip_html(st.get("description"))
+    own, *quoted = re.split(r"//\s*@", body, maxsplit=1)
+    parts = ["本条作者文字：\n" + _excerpt(own.strip(), limit, query)] if own.strip() else []
+    if quoted:
+        parts.append("引用文字（不代表本条作者的新观点）：\n" + _excerpt("//@" + quoted[0], limit, query))
+    original = st.get("retweeted_status") or {}
+    if original:
+        name, _ = _author(original)
+        text = strip_html(original.get("text")) or strip_html(original.get("description"))
+        parts.append(f"被转发帖（作者：{name}）：\n{_excerpt(text, limit, query)}\n{post_url(original)}")
+    elif st.get("retweet_status_id"):
+        parts.append(f"被转发帖 ID：{st['retweet_status_id']}（正文未返回，可用 get_post 查阅）")
+    return "\n\n".join(parts) or "（无正文，可能是图片或视频帖）"
+
+
+def _render_post(st: dict, idx: int | None = None, body_limit: int = 220, query: str = "") -> str:
     _, who = _author(st)
     title = strip_html(st.get("title"))
     num = f"{idx}. " if idx else ""
@@ -64,7 +103,9 @@ def _render_post(st: dict, idx: int | None = None, body_limit: int = 220) -> str
     )
     if st.get("view_count"):
         meta += f" 阅{fmt_count(st.get('view_count'))}"
-    lines = [head, meta, _post_body(st, body_limit)]
+    uid = st.get("user_id") or (st.get("user") or {}).get("id")
+    kind = "转发/回复，需区分本人文字与引用" if st.get("retweet_status_id") or st.get("retweeted_status") else "本人发布（无转发标记，不保证内容原创）"
+    lines = [head, meta, f"作者 user_id: {uid or '未知'}　类型：{kind}", _post_body(st, body_limit, query)]
     url = post_url(st)
     if url:
         lines.append(f"帖子ID {st.get('id')}　{url}")
@@ -172,6 +213,8 @@ async def search_users(query: str, count: int = 10, page: int = 1) -> str:
         return f"未搜到与「{query}」相关的用户。"
 
     out = [f"### 「{query}」相关用户（第 {page} 页，共约 {data.get('count', '?')} 位）"]
+    if len(users) > 1:
+        out.append("有多个候选账号：简称不一定等于完整昵称，不要直接选第一项或仅凭粉丝数认定身份。请结合用户提供的完整昵称、主页及简介核对。")
     for i, user in enumerate(users, (page - 1) * count + 1):
         uid = user.get("id")
         name = strip_html(user.get("screen_name")) or f"用户{uid}"
@@ -190,25 +233,53 @@ async def search_posts(
     query: str, count: int = 10, page: int = 1, user_id: str | None = None
 ) -> str:
     """搜索帖子；指定 user_id 时只搜索该用户的帖子。"""
-    uid = str(user_id).strip() if user_id is not None else ""
-    if uid and (not uid.isascii() or not uid.isdigit() or int(uid) <= 0):
+    query = query.strip()
+    if not query:
+        return "query 不能为空；查看作者最新动态请使用 get_user_posts。"
+    uid = _user_id(user_id) if user_id is not None else ""
+    if user_id is not None and not uid:
         return "user_id 需要是雪球用户的正整数数字 ID（见帖子链接 xueqiu.com/<user_id>/<post_id>）。"
     count = max(1, min(int(count), 30))
     page = max(1, int(page))
-    params = {"q": query, "count": count, "page": page, "sort": "time"}
-    path = "/query/v1/search/status.json"
+    client = get_client()
     if uid:
-        # 全站搜索会忽略 uid，必须使用用户专属搜索接口才能正确筛选及分页。
-        path = "/query/v1/user/status/search.json"
-        params["uid"] = uid
-    data = await get_client().get(path, params, base=APP_API, referer=REFERER)
-    posts = data.get("list") or []
+        # 实测该接口以 10 条为一页推进，但 count<10 会裁掉该页后续结果：
+        # count=3/page=1 只取到前三条，page=2 就跳过了同页余下的结果。
+        # 固定上游页长，再映射工具的任意页长；每次最多请求 4 页。
+        offset = (page - 1) * count
+        first_page = offset // 10 + 1
+        last_page = (offset + count - 1) // 10 + 1
+        window = []
+        for upstream_page in range(first_page, last_page + 1):
+            data = await client.get(
+                "/query/v1/user/status/search.json",
+                {"q": query, "count": 10, "page": upstream_page, "sort": "time", "uid": uid},
+                base=APP_API, referer=REFERER,
+            )
+            batch = data.get("list") or []
+            window.extend(batch)
+            if len(batch) < 10:
+                break
+        raw_posts = window[offset % 10:offset % 10 + count]
+    else:
+        data = await client.get(
+            "/query/v1/search/status.json",
+            {"q": query, "count": count, "page": page, "sort": "time"},
+            base=APP_API, referer=REFERER,
+        )
+        raw_posts = data.get("list") or []
+    posts = [p for p in raw_posts if _is_author(p, uid)] if uid else raw_posts
+    rejected = len(raw_posts) - len(posts)
     scope = f"用户 {uid} 的" if uid else ""
     if not posts:
-        return f"未搜到{scope}与「{query}」相关的帖子。"
-    head = f"### {scope}「{query}」相关帖子（第 {page} 页，共约 {data.get('count', '?')} 条）\n"
+        reason = f"上游返回的 {rejected} 条结果无法通过作者身份校验，已排除。" if rejected else "本页搜索未返回结果，不代表该作者从未谈及此主题。"
+        return f"未搜到{scope}与「{query}」相关的帖子。{reason}可缩短关键词或用 get_user_posts 查看动态。"
+    head = f"### {scope}「{query}」相关帖子（第 {page} 页，本页 {len(posts)} 条）\n"
+    head += "以下为关键词附近摘录；引用前请用 get_post 获取全文并核对上下文。\n"
+    if rejected:
+        head += f"已排除 {rejected} 条作者不符或身份不明的结果。\n"
     return head + "\n\n---\n\n".join(
-        _render_post(p, i) for i, p in enumerate(posts, (page - 1) * count + 1)
+        _render_post(p, i, body_limit=600, query=query) for i, p in enumerate(posts, (page - 1) * count + 1)
     )
 
 
@@ -293,7 +364,8 @@ async def get_post(
         f" 转{fmt_count(st.get('retweet_count'))}",
         post_url(st),
         "",
-        strip_html(st.get("text")) or strip_html(st.get("description")) or "（无正文）",
+        f"作者 user_id: {st.get('user_id') or (st.get('user') or {}).get('id') or '未知'}",
+        _post_body(st, None),
     ]
 
     if with_comments:
@@ -313,8 +385,8 @@ async def get_post(
 
 async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
     """某位雪球用户的发帖动态。user_id 是雪球用户的数字 ID。"""
-    uid = str(user_id).strip().rstrip("/").split("/")[-1]
-    if not uid.isdigit():
+    uid = _user_id(user_id)
+    if not uid:
         return "user_id 需要是雪球用户的数字 ID（可在帖子链接 xueqiu.com/<user_id>/<post_id> 中找到）。"
 
     data = await get_client().get(
@@ -323,9 +395,9 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
         base=APP_API,
         referer=REFERER,
     )
-    posts = data.get("statuses") or []
+    posts = [p for p in (data.get("statuses") or []) if _is_author(p, uid)]
     if not posts:
         return f"用户 {uid} 暂无公开动态。"
     name, _ = _author(posts[0])
-    head = f"### {name}（uid {uid}）的动态（第 {page} 页，共 {data.get('count', '?')} 条）\n"
+    head = f"### {name}（uid {uid}）的动态（第 {page} 页，本页 {len(posts)} 条）\n"
     return head + "\n\n---\n\n".join(_render_post(p, i) for i, p in enumerate(posts, 1))

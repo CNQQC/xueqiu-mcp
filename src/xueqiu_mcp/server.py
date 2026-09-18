@@ -39,6 +39,13 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
 
+查某个人的一手观点时，先 search_users 找到并核对账号，再 search_posts(query=主题词,
+user_id=该账号ID)。不要仅把人名拼进全站搜索的 query，否则会搜到别人讨论他或转载他的帖子。
+昵称有歧义时请列出候选，不要默认粉丝最多的人就是目标。已知主页链接也可直接作为 user_id。
+结果中的作者 ID 必须属于目标账号；本人发帖也可能引用他人，务必区分「本条作者文字」、
+「引用文字」和「被转发帖」。用 get_post 读取全文后再归纳观点，并附作者、时间和帖子原链接。
+搜索无结果不等于作者没有说过；可缩短关键词、翻页或用 get_user_posts 查看近期动态。
+
 接口偶发返回「未登录」时，客户端会使用现有凭证自动重试一次，不会清除登录态。
 关于登录：少数受风控保护的社区接口和账号相关数据需要登录。自动重试后仍因未登录
 而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，不要
@@ -348,7 +355,8 @@ async def get_hot_posts(count: int = 10) -> str:
 async def search_users(query: str, count: int = 10, page: int = 1) -> str:
     """按昵称或关键词搜索雪球用户，返回用户 ID、昵称、主页及可用的认证和简介。
 
-    不知道作者 ID 时先调用本工具。结合返回信息区分同名用户，确认目标后，将
+    不知道作者 ID 时先调用本工具；支持昵称片段，例如「老木匠」可找到「买股票的老木匠」。
+    结果第一项可能是其他同名账号，简称不能直接当作完整昵称。结合返回信息区分用户，确认目标后，将
     user_id 传给 search_posts 搜索该作者的帖子，或 get_user_posts 查看动态。
 
     Args:
@@ -363,13 +371,16 @@ async def search_users(query: str, count: int = 10, page: int = 1) -> str:
 async def search_posts(
     query: str, count: int = 10, page: int = 1, user_id: str | None = None
 ) -> str:
-    """搜索雪球帖子，可限定为某位用户的帖子。
+    """搜索雪球帖子及关键词附近原文摘录，可限定作者并校验作者 ID。
+
+    查某人一手观点必须先 search_users 确认账号，再传 user_id；只在 query 里写人名会
+    搜到他人的转述。结果区分作者文字和引用/转发；引用观点前用 get_post 获取全文。
 
     Args:
         query: 关键词，如「宇树」「红利策略」
         count: 条数，最多 30
         page: 页码
-        user_id: 可选的雪球用户数字 ID，可先用 search_users 按昵称查找；不填则全站搜索
+        user_id: 雪球用户数字 ID 或主页/帖子链接，可先用 search_users 查找；不填则全站搜索
     """
     return await social.search_posts(query, count, page, user_id)
 
@@ -397,7 +408,7 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
     """查看某位雪球用户的发帖动态，用于跟踪特定作者的观点。
 
     Args:
-        user_id: 雪球用户数字 ID（见帖子链接 xueqiu.com/<user_id>/<post_id>）
+        user_id: 雪球用户数字 ID 或主页/帖子链接（xueqiu.com/<user_id>/<post_id>）
         count: 条数，最多 30
         page: 页码
     """

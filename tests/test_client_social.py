@@ -119,6 +119,84 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_nickname_does_not_pick_first_same_name_account(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [
+            {"id": 1321612666, "screen_name": "老木匠"},
+            {"id": 3058599833, "screen_name": "买股票的老木匠", "description": "职业木匠偶尔炒股"},
+        ]}
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_users("老木匠")
+        for text in ("买股票的老木匠", "3058599833", "有多个候选账号", "不要直接选第一项"):
+            self.assertIn(text, result)
+
+    async def test_search_rejects_wrong_unknown_and_conflicting_authors(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [
+            {"id": 1, "user_id": 123, "text": "本人观点"},
+            {"id": 2, "user_id": 456, "text": "其他人提及目标用户"},
+            {"id": 3, "text": "作者未知"},
+            {"id": 4, "user_id": 123, "user": {"id": 456}, "text": "矛盾身份"},
+            {"id": 5, "user": {"id": 123}, "text": "用户对象中的身份"},
+        ]}
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_posts("观点", user_id="123")
+        for text in ("本人观点", "https://xueqiu.com/123/5", "已排除 3 条", "本页 2 条"):
+            self.assertIn(text, result)
+        for text in ("其他人提及", "作者未知", "矛盾身份"):
+            self.assertNotIn(text, result)
+
+    async def test_search_keyword_excerpt_and_quoted_context(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [{
+            "id": 1, "user_id": 123, "text": "开头" * 1500 + "茅台本人观点//@另一个人:茅台引用观点",
+            "retweet_status_id": 2, "retweeted_status": {
+                "id": 2, "user_id": 456, "user": {"screen_name": "原帖作者"}, "text": "茅台原帖文字",
+            },
+        }]}
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_posts("茅台", user_id="123")
+        for text in ("茅台本人观点", "引用文字", "被转发帖（作者：原帖作者）", "https://xueqiu.com/456/2", "get_post"):
+            self.assertIn(text, result)
+        self.assertNotIn("开头" * 1500, result)
+
+    async def test_homepage_and_post_urls_resolve_author_not_post(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [], "statuses": []}
+        with patch.object(social, "get_client", return_value=client):
+            for url in ("https://xueqiu.com/123/", "https://xueqiu.com/123/456?from=search"):
+                await social.search_posts(" 茅台 ", user_id=url)
+                self.assertEqual(client.get.call_args.args[1]["uid"], "123")
+                self.assertEqual(client.get.call_args.args[1]["q"], "茅台")
+                await social.get_user_posts(url)
+                self.assertEqual(client.get.call_args.args[1]["user_id"], "123")
+            client.get.reset_mock()
+            await social.search_posts("茅台", user_id="https://example.com/123")
+            await social.search_posts("  ", user_id="123")
+            client.get.assert_not_awaited()
+
+    async def test_only_wrong_authors_is_not_reported_as_no_history(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [{"id": 1, "user_id": 456, "text": "不相关"}]}
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_posts("茅台", user_id="123")
+        self.assertIn("无法通过作者身份校验", result)
+        self.assertNotIn("不相关", result)
+
+    async def test_full_post_separates_author_quote_and_retweet(self):
+        client = AsyncMock()
+        body = "这是本人文字" * 100
+        client.get.return_value = {
+            "id": 1, "user_id": 123, "text": body + "//@别人:他人的看法",
+            "retweeted_status": {"id": 2, "user_id": 456, "text": "原帖文字"},
+        }
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.get_post("1", with_comments=False)
+        self.assertIn(body, result)
+        self.assertIn("引用文字（不代表本条作者的新观点）", result)
+        self.assertIn("https://xueqiu.com/456/2", result)
+        self.assertIn("作者 user_id: 123", result)
+
     async def test_user_keyword_search_returns_ids_and_disambiguation(self):
         client = AsyncMock()
         client.get.return_value = {"count": 10, "list": [
@@ -164,17 +242,41 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_filtered_search_pagination_and_output(self):
         client = AsyncMock()
-        client.get.return_value = {"list": [{"id": 1, "user_id": 123, "text": "红利投资"}], "count": 20}
+        client.get.return_value = {"list": [{"id": i, "user_id": 123, "text": "红利投资"} for i in range(1, 11)], "count": 10}
         with patch.object(social, "get_client", return_value=client):
             output = await social.search_posts("红利", count=5, page=2, user_id=" 123 ")
         client.get.assert_awaited_once_with(
             "/query/v1/user/status/search.json",
-            {"q": "红利", "count": 5, "page": 2, "sort": "time", "uid": "123"},
+            {"q": "红利", "count": 10, "page": 1, "sort": "time", "uid": "123"},
             base=APP_API, referer=social.REFERER,
         )
         self.assertIn("用户 123", output)
         self.assertIn("第 2 页", output)
         self.assertIn("**6.", output)
+        self.assertIn("帖子ID 6", output)
+        self.assertNotIn("帖子ID 1　", output)
+
+    async def test_small_pages_do_not_skip_remaining_matches(self):
+        client = AsyncMock()
+        client.get.return_value = {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(1, 7)]}
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_posts("茅台", user_id="123", count=3, page=2)
+        self.assertEqual(client.get.call_args.args[1]["page"], 1)
+        for pid in (4, 5, 6):
+            self.assertIn(f"帖子ID {pid}", result)
+
+    async def test_user_search_page_spans_upstream_boundaries(self):
+        client = AsyncMock()
+        client.get.side_effect = [
+            {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(1, 11)]},
+            {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(11, 21)]},
+        ]
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.search_posts("茅台", user_id="123", count=7, page=2)
+        self.assertEqual([call.args[1]["page"] for call in client.get.call_args_list], [1, 2])
+        for pid in range(8, 15):
+            self.assertIn(f"帖子ID {pid}　", result)
+        self.assertNotIn("帖子ID 15　", result)
 
     async def test_invalid_user_does_not_silently_search_everyone(self):
         client = AsyncMock()
@@ -190,7 +292,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
             output = await social.search_posts("红利", count=100, page=0, user_id="123")
         self.assertIn("用户 123", output)
         self.assertEqual(client.get.call_args.args[1]["page"], 1)
-        self.assertEqual(client.get.call_args.args[1]["count"], 30)
+        self.assertEqual(client.get.call_args.args[1]["count"], 10)
 
     async def test_mcp_exposes_optional_user_filter(self):
         from xueqiu_mcp import server

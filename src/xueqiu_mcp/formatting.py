@@ -235,10 +235,13 @@ def fmt_count(v: Any) -> str:
 
 def post_url(status: dict) -> str:
     """拼出帖子的雪球网页地址。"""
+    uid = status.get("user_id") or (status.get("user") or {}).get("id")
+    sid = status.get("id")
+    if uid and sid:
+        return f"https://xueqiu.com/{uid}/{sid}"
     target = status.get("target") or ""
     if target.startswith("http"):
         return target
     if target:
         return "https://xueqiu.com" + target
-    uid, sid = status.get("user_id"), status.get("id")
-    return f"https://xueqiu.com/{uid}/{sid}" if uid and sid else ""
+    return ""
