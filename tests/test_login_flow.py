@@ -177,6 +177,41 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         new = await self.flow.start()
         self.assertNotEqual(old.token, new.token)
 
+    async def test_cancel_when_snapshot_completes_stops_watcher(self):
+        async def snapshot(mode):
+            # 让响应完成和取消落在同一次调度，复现旧版 wait_for 吞掉取消。
+            self.flow._task.cancel()
+            return {"logged_in": False, "qr_data": QR}
+
+        self.session.login_snapshot.side_effect = snapshot
+        attempt = await self.flow.start()
+        task = self.flow._task
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        # 失败时也让 teardown 收尾，避免回归测试本身挂住五分钟。
+        if not done:
+            attempt.deadline = 0
+        self.assertIn(task, done, "响应完成时的取消被吞掉，轮询仍在继续")
+        self.assertTrue(task.cancelled())
+        self.assertEqual(attempt.state, "cancelled")
+        self.session.close_login_page.assert_awaited()
+
+    async def test_snapshot_timeout_cancels_inflight_read(self):
+        cancelled = asyncio.Event()
+
+        async def snapshot(mode):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        self.session.login_snapshot.side_effect = snapshot
+        attempt = await self.flow.start()
+        attempt.deadline = time.monotonic() + 0.03
+        await asyncio.wait_for(attempt.done.wait(), 0.5)
+        self.assertEqual(attempt.state, "expired")
+        self.assertTrue(cancelled.is_set())
+        self.session.close_login_page.assert_awaited()
+
     async def test_manual_cookie_login_cancels_pending_scan(self):
         attempt = await self.flow.start()
         with patch.object(auth, "fetch_profile", return_value={"id": 123}):

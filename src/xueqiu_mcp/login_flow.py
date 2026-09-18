@@ -130,7 +130,19 @@ class LoginFlow:
             while attempt.deadline > time.monotonic():
                 # 每次只观察现有页面，不刷新页面或重建扫码会话。
                 remaining = attempt.deadline - time.monotonic()
-                res = await asyncio.wait_for(session.login_snapshot(attempt.mode), remaining)
+                # Python 3.10/3.11 的 wait_for 在子任务完成与外部取消同时发生时，
+                # 可能吞掉取消，导致 close() 一直等到整个扫码会话过期。
+                snapshot = asyncio.create_task(session.login_snapshot(attempt.mode))
+                try:
+                    done, _ = await asyncio.wait({snapshot}, timeout=remaining)
+                    if not done:
+                        raise asyncio.TimeoutError
+                    res = snapshot.result()
+                finally:
+                    if not snapshot.done():
+                        snapshot.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await snapshot
                 if res["logged_in"]:
                     await self._adopt(session, attempt)
                     return
