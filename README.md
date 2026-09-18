@@ -121,7 +121,8 @@ macOS 可以直接跑安装脚本。它会自动等 Claude 完全退出（运行
 | `get_stock_discussions` | 个股讨论区，可按热度或时间排序 |
 | `get_stock_news` | 个股新闻 / 公司公告流 |
 | `get_hot_posts` | 雪球首页热门讨论 |
-| `search_posts` | 全站搜索帖子 |
+| `search_posts` | 按关键词搜索帖子，可用 `user_id` 限定作者 |
+| `search_users` | 按昵称或关键词搜索用户，返回用户 ID、主页、认证和简介 |
 | `get_post` | 帖子全文 + 热门评论 |
 | `get_user_posts` | 某位用户的发帖动态 |
 
@@ -164,6 +165,11 @@ filters="pettm:0~20,dy_l:3~,mc:100000000000~"
 
 即市盈率 0~20 倍、股息率 3% 以上、市值 1000 亿以上。边界可留空表示不限。
 指标名可用 `list_screener_metrics` 查询，`_l` 后缀表示取最新报告期。
+
+不知道作者 ID 时，先用 `search_users(query="久期财经")` 按昵称或关键词查找，结合昵称、
+认证、简介和主页区分同名用户。得到 `user_id` 后即可限定作者搜索帖子，
+例如 `search_posts(query="红利", user_id="4357540281", count=10, page=1)`。
+`user_id` 是帖子链接 `xueqiu.com/<user_id>/<post_id>` 中的用户数字 ID；不传则全站搜索。
 
 ## 登录
 
@@ -223,6 +229,9 @@ pbpaste | .venv/bin/xueqiu-mcp login --cookie -
 **不需要你先知道要登录。** 任何工具一旦因为没有登录态而失败，返回给模型的报错里会
 直接附上完整的登录步骤（去哪复制 Cookie、复制哪一行、之后调哪个工具），模型照着念
 给你听就行 —— 不会出现「该接口需要登录」然后双方一起卡住的情况。
+
+JSON 接口偶发返回「未登录」时，会使用现有凭证自动重试一次，不清除 Cookie，也不触发
+重新登录。重试仍失败才返回登录指引；限流和普通业务错误不会按此规则重试。
 
 未登录的失败有两种现场：主域接口拿回 WAF 挑战页，以及接口正常返回但雪球说这次请求
 没有身份（`用户未登录`、`用户id无效` 等错误码）。两种都会被认出来并带上同一份指引。
@@ -416,6 +425,7 @@ MOCK_RTT=0 .venv/bin/python tests/bench.py # 零延迟，放大纯代码开销
 .venv/bin/python tests/test_mcp_e2e.py   # 端到端，需要联网
 .venv/bin/python tests/test_cache.py     # 缓存层，零网络
 .venv/bin/python tests/test_auth.py      # 登录与凭证，零网络
+.venv/bin/python tests/test_client_social.py  # 接口重试与用户搜索，零网络
 .venv/bin/python tests/test_browser.py   # 本地浏览器层，零网络、不启动浏览器
 .venv/bin/python tests/test_login_flow.py # 扫码会话、网页、MCP 原生图片契约，假浏览器
 ```

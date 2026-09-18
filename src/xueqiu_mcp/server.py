@@ -39,7 +39,8 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
 
-关于登录：少数受风控保护的社区接口和账号相关数据需要登录。任何工具一旦因为未登录
+接口偶发返回「未登录」时，客户端会使用现有凭证自动重试一次，不会清除登录态。
+关于登录：少数受风控保护的社区接口和账号相关数据需要登录。自动重试后仍因未登录
 而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，不要
 只回一句「需要登录」就停下。首选 get_login_qrcode（立即返回二维码图片和临时登录链接，
 请把图片和链接直接展示给用户，用户用雪球 App 扫码后后台会自动保存凭证）；不要先等待
@@ -344,15 +345,33 @@ async def get_hot_posts(count: int = 10) -> str:
 
 
 @mcp.tool()
-async def search_posts(query: str, count: int = 10, page: int = 1) -> str:
-    """全站搜索雪球帖子。
+async def search_users(query: str, count: int = 10, page: int = 1) -> str:
+    """按昵称或关键词搜索雪球用户，返回用户 ID、昵称、主页及可用的认证和简介。
+
+    不知道作者 ID 时先调用本工具。结合返回信息区分同名用户，确认目标后，将
+    user_id 传给 search_posts 搜索该作者的帖子，或 get_user_posts 查看动态。
+
+    Args:
+        query: 用户昵称或关键词，如「久期财经」
+        count: 条数，最多 30
+        page: 页码
+    """
+    return await social.search_users(query, count, page)
+
+
+@mcp.tool()
+async def search_posts(
+    query: str, count: int = 10, page: int = 1, user_id: str | None = None
+) -> str:
+    """搜索雪球帖子，可限定为某位用户的帖子。
 
     Args:
         query: 关键词，如「宇树」「红利策略」
         count: 条数，最多 30
         page: 页码
+        user_id: 可选的雪球用户数字 ID，可先用 search_users 按昵称查找；不填则全站搜索
     """
-    return await social.search_posts(query, count, page)
+    return await social.search_posts(query, count, page, user_id)
 
 
 @mcp.tool()

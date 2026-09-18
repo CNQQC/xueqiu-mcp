@@ -49,6 +49,12 @@ jobs:
       - name: 缓存层测试
         run: python tests/test_cache.py
 
+      - name: 接口重试与用户搜索测试
+        run: python tests/test_client_social.py
+
+      - name: 部署入口测试
+        run: python tests/test_deploy.py
+
       - name: 登录与凭证测试
         # 该用例会把 XUEQIU_COOKIE_FILE 指向临时目录，不会碰到 ~/.xueqiu-mcp/
         run: python tests/test_auth.py

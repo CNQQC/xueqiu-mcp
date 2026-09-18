@@ -3,9 +3,24 @@
 #
 # 拆成「稳定的入口 + 仓库里的脚本」两段，是因为 bash 边读边执行：如果让定时器直接跑
 # 仓库里的 deploy.sh，fetch 正好把这个文件换掉，正在执行的脚本会读到错位的内容。
-# 这里先把仓库更新完，再 exec 进新版脚本 —— exec 一次性载入，之后文件再变也没影响。
+# 更新仓库和执行脚本期间始终持有同一把锁，避免并发部署改写执行中的文件。
 set -euo pipefail
 SRC=/opt/xueqiu-mcp/.src
+
+# Actions 专用 SSH key 使用 forced command，原始命令仅允许一个完整提交 SHA。
+# 本机手动运行可以不传参数，继续部署最新 main。
+expected=${1:-${SSH_ORIGINAL_COMMAND:-}}
+if [ -n "$expected" ] && [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+  echo '[deploy] 只接受完整提交 SHA' >&2
+  exit 2
+fi
+exec 9>/run/lock/xueqiu-deploy.lock
+flock -w 300 9
 git -C "$SRC" fetch -q --prune origin main
+latest=$(git -C "$SRC" rev-parse origin/main)
+if [ -n "$expected" ] && [ "$expected" != "$latest" ]; then
+  echo "[deploy] main 已更新，跳过过期提交 $expected，等待最新提交通过 CI"
+  exit 0
+fi
 git -C "$SRC" reset -q --hard origin/main
 exec bash "$SRC/deploy/deploy.sh"

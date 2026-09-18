@@ -154,19 +154,59 @@ async def get_hot_posts(count: int = 10) -> str:
     )
 
 
-async def search_posts(query: str, count: int = 10, page: int = 1) -> str:
-    """全站搜索帖子。"""
+async def search_users(query: str, count: int = 10, page: int = 1) -> str:
+    """按昵称或关键词查找用户，返回可供帖子搜索使用的 user_id。"""
+    query = query.strip()
+    if not query:
+        return "query 不能为空，请输入用户昵称或关键词。"
     count = max(1, min(int(count), 30))
+    page = max(1, int(page))
     data = await get_client().get(
-        "/query/v1/search/status.json",
-        {"q": query, "count": count, "page": max(1, int(page)), "sort": "time"},
+        "/query/v1/search/user.json",
+        {"q": query, "count": count, "page": page},
         base=APP_API,
         referer=REFERER,
     )
+    users = data.get("list") or []
+    if not users:
+        return f"未搜到与「{query}」相关的用户。"
+
+    out = [f"### 「{query}」相关用户（第 {page} 页，共约 {data.get('count', '?')} 位）"]
+    for i, user in enumerate(users, (page - 1) * count + 1):
+        uid = user.get("id")
+        name = strip_html(user.get("screen_name")) or f"用户{uid}"
+        lines = [f"**{i}. {name}**", f"user_id: {uid}　粉丝：{fmt_count(user.get('followers_count'))}"]
+        for label, field in (("认证", "verified_description"), ("简介", "description")):
+            detail = strip_html(user.get(field), 200)
+            if detail:
+                lines.append(f"{label}：{detail}")
+        lines.append(f"https://xueqiu.com/{uid}")
+        out.append("\n".join(lines))
+    out.append("请结合昵称、认证和简介确认目标用户，再将 user_id 传给 search_posts 或 get_user_posts。")
+    return "\n\n".join(out)
+
+
+async def search_posts(
+    query: str, count: int = 10, page: int = 1, user_id: str | None = None
+) -> str:
+    """搜索帖子；指定 user_id 时只搜索该用户的帖子。"""
+    uid = str(user_id).strip() if user_id is not None else ""
+    if uid and (not uid.isascii() or not uid.isdigit() or int(uid) <= 0):
+        return "user_id 需要是雪球用户的正整数数字 ID（见帖子链接 xueqiu.com/<user_id>/<post_id>）。"
+    count = max(1, min(int(count), 30))
+    page = max(1, int(page))
+    params = {"q": query, "count": count, "page": page, "sort": "time"}
+    path = "/query/v1/search/status.json"
+    if uid:
+        # 全站搜索会忽略 uid，必须使用用户专属搜索接口才能正确筛选及分页。
+        path = "/query/v1/user/status/search.json"
+        params["uid"] = uid
+    data = await get_client().get(path, params, base=APP_API, referer=REFERER)
     posts = data.get("list") or []
+    scope = f"用户 {uid} 的" if uid else ""
     if not posts:
-        return f"未搜到与「{query}」相关的帖子。"
-    head = f"### 「{query}」相关帖子（第 {page} 页，共约 {data.get('count', '?')} 条）\n"
+        return f"未搜到{scope}与「{query}」相关的帖子。"
+    head = f"### {scope}「{query}」相关帖子（第 {page} 页，共约 {data.get('count', '?')} 条）\n"
     return head + "\n\n---\n\n".join(
         _render_post(p, i) for i, p in enumerate(posts, (page - 1) * count + 1)
     )

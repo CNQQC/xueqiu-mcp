@@ -33,6 +33,7 @@ CASES: list[tuple[str, dict, list[str]]] = [
     ("get_stock_news", {"symbol": "600519", "kind": "notice", "count": 2}, ["公告"]),
     ("get_hot_posts", {"count": 2}, ["雪球热门讨论"]),
     ("search_posts", {"query": "红利", "count": 2}, ["相关帖子"]),
+    ("search_users", {"query": "久期财经", "count": 3}, ["相关用户", "4357540281"]),
     ("get_user_posts", {"user_id": "1955602780", "count": 2}, ["动态"]),
     # --- 中文名解析 ---
     ("get_quote", {"symbols": "贵州茅台"}, ["SH600519"]),

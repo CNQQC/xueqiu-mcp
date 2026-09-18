@@ -321,25 +321,38 @@ class XueqiuClient:
         client = await self._ensure_client()
         headers = {"Referer": referer} if referer else None
 
-        async with self._gate:  # 上游并发闸门
-            self._upstream_calls += 1
-            resp = await client.get(base + path, params=clean, headers=headers)
+        # JSON「未登录」可能只是上游偶发错误。先原样重试，不能据此清 Cookie
+        # 或刷新 token；每次逻辑请求最多发两次，重试也经过并发闸门和请求合并。
+        for attempt in range(2):
+            async with self._gate:
+                self._upstream_calls += 1
+                resp = await client.get(base + path, params=clean, headers=headers)
 
-            # 限流要单独认出来：它的响应体常常也是 HTML，会被下面的挑战页判定误伤
             if resp.status_code == 429:
                 raise RateLimitedError(path)
 
-            # token 失效：强制刷新后重试一次
-            if resp.status_code in (400, 401, 403) and not self.has_user_cookie:
-                await self._refresh_token(force=True)
-                self._upstream_calls += 1
-                resp = await client.get(base + path, params=clean, headers=headers)
-                if resp.status_code == 429:
-                    raise RateLimitedError(path)
+            try:
+                data = self._decode_response(path, resp.content)
+            except NeedLoginError:
+                if attempt:
+                    raise
+                log.info("接口 %s 返回未登录，使用现有凭证重试一次", path)
+                continue
+            except XueqiuError:
+                if attempt or self.has_user_cookie or resp.status_code not in (400, 401, 403):
+                    raise
+            else:
+                if attempt or self.has_user_cookie or resp.status_code not in (400, 401, 403):
+                    return data, len(resp.content) * OBJECT_SIZE_FACTOR
 
-        raw = resp.content
-        # 只看前几个字节判断是不是 WAF 挑战页，别对整个响应体做解码和 lstrip：
-        # 500 根 K 线有 79KB，全量复制两次纯属浪费。
+            # 保留匿名 HTTP 鉴权失败的 token 刷新兜底，与 JSON 未登录重试分开。
+            await self._refresh_token(force=True)
+
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _decode_response(path: str, raw: bytes) -> Any:
+        # 只检查开头，避免为大 JSON 复制和解码整个响应体。
         if raw[:32].lstrip()[:1] == b"<":
             raise NeedCookieError(path)
 
@@ -358,7 +371,7 @@ class XueqiuClient:
                 )
             if data.get("status") and data.get("error") and "data" not in data:
                 raise XueqiuError(f"雪球接口 {path} 报错：{data.get('error')}（HTTP {data.get('status')}）")
-        return data, len(raw) * OBJECT_SIZE_FACTOR
+        return data
 
     async def get(
         self,

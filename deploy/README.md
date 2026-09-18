@@ -1,7 +1,23 @@
 # 部署
 
-服务器主动拉取，GitHub 不需要任何进入你机器的凭证 —— 不开入站端口、不存私钥。
-代价是部署有最多 5 分钟延迟。
+main 更新后先运行 CI；全部通过后，GitHub Actions 的 `Deploy VPS` 工作流通过专用
+SSH key 调用 VPS 上的部署入口，拉取已验证的提交并重启服务。失败会显示在 Actions。
+原有的 5 分钟定时拉取在启用 Actions 后应停用，避免绕过 CI。
+
+## GitHub Actions 配置
+
+仓库 Actions secret：`VPS_DEPLOY_KEY`（专用 SSH 私钥）。仓库 Actions variables：
+`VPS_HOST`、`VPS_USER`、`VPS_KNOWN_HOSTS`（经可信 SSH 连接核验的主机公钥记录）。
+
+专用公钥在 VPS 的 `authorized_keys` 中使用如下限制：
+
+```
+restrict,command="/usr/local/bin/xueqiu-deploy" ssh-ed25519 <专用公钥> xueqiu-github-actions
+```
+
+该 key 只能触发部署；入口仅接受完整的 40 位提交 SHA。部署前获取最新 main，若 CI
+对应的提交已过时则跳过，等待最新提交通过 CI。并发部署通过文件锁串行执行。
+需要重试时，在 GitHub Actions 重新运行该提交的 CI，或手动运行 main 分支的 CI。
 
 ## 布局
 
@@ -38,7 +54,8 @@ MCP 进程的 `/login/...`。这两条路径使用 5 分钟随机 token，浏览
 
 ## 一次部署做了什么
 
-1. `git fetch && reset --hard origin/main`；HEAD 与 `.deployed-sha` 相同就安静退出；
+1. 获取部署锁，`git fetch` 并确认 CI 提交仍是最新 main，再 `reset --hard origin/main`；
+   HEAD 与 `.deployed-sha` 相同就安静退出；
 2. 备份当前 `xueqiu_mcp/`；
 3. rsync 新代码；
 4. **先旁路 import 一遍**。语法错、缺依赖在这里就被拦下，服务连停都不用停，
@@ -53,18 +70,20 @@ MCP 进程的 `/login/...`。这两条路径使用 5 分钟随机 token，浏览
 git clone https://github.com/CNQQC/xueqiu-mcp.git /opt/xueqiu-mcp/.src
 install -m 755 /opt/xueqiu-mcp/.src/deploy/xueqiu-deploy /usr/local/bin/xueqiu-deploy
 install -m 644 /opt/xueqiu-mcp/.src/deploy/xueqiu-deploy.{service,timer} /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now xueqiu-deploy.timer
+systemctl daemon-reload
+# 使用 Actions 自动部署时，停用旧定时器。
+systemctl disable --now xueqiu-deploy.timer
 ```
 
 ## 运维
 
 ```bash
-xueqiu-deploy                              # 立刻部署一次，不等定时器
-systemctl list-timers xueqiu-deploy.timer  # 下次什么时候跑
-journalctl -u xueqiu-deploy -n 50          # 部署日志
+xueqiu-deploy                              # 运维手动部署最新 main（不等待 CI）
+# Actions 的部署日志在 GitHub Actions → Deploy VPS 中。
+journalctl -u xueqiu-mcp -n 50             # 应用日志
 cat /opt/xueqiu-mcp/.deployed-sha          # 当前跑的是哪个提交
 ```
 
-回滚到某个旧版本：把那个 commit 推成 main 的 HEAD 即可，定时器会自己跟上。
+回滚到某个旧版本：在 main 提交对应的 revert，CI 通过后 Actions 会自动部署。
 紧急情况直接 `mv /opt/xueqiu-mcp/xueqiu_mcp.bak-<时间戳> /opt/xueqiu-mcp/xueqiu_mcp`
 再 `systemctl restart xueqiu-mcp`。

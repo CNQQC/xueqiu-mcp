@@ -60,8 +60,7 @@ if ! (cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -c "import xueqiu_mcp.server"
   exit 1
 fi
 
-systemctl restart "$SERVICE"
-if health; then
+if systemctl restart "$SERVICE" && health; then
   echo "$target" > "$MARK"
   log "部署成功 ${target:0:8}"
   # 只留最近几份备份，1.6G 的机器上磁盘和内存一样要省
