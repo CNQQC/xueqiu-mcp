@@ -14,7 +14,10 @@ OutputFormat = Literal["markdown", "json"]
 
 def tool_result(value: str | dict, format: OutputFormat, *, error: bool = False) -> CallToolResult:
     failed = error or (format == "json" and isinstance(value, str))
-    if format == "json":
+    if error and isinstance(value, dict):
+        payload = value
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if format == "json" else value["error"]["message"]
+    elif format == "json":
         payload = {"error": value} if failed else value
         text = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     else:

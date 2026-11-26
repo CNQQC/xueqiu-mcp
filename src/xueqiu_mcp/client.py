@@ -106,6 +106,14 @@ class XueqiuError(RuntimeError):
     """雪球接口返回的业务错误。"""
 
 
+class PostNotFoundError(XueqiuError):
+    """雪球帖子详情端点明确回复帖子不存在。"""
+
+    def __init__(self, code, desc):
+        self.upstream_code = str(code)
+        super().__init__(desc or "您访问的页面不存在")
+
+
 class RateLimitedError(XueqiuError):
     """被上游限流。
 
@@ -158,7 +166,7 @@ class NeedLoginError(XueqiuError):
         super().__init__(f"接口 {endpoint} 需要登录{detail}\n\n{LOGIN_GUIDE}")
 
 
-def raise_business_error(endpoint: str, code: Any, desc: str) -> None:
+def raise_business_error(endpoint: str, code: Any, desc: str, status: int = 200) -> None:
     """把雪球的业务错误码翻成异常。永远抛，不返回。
 
     先认「没登录」再落到通用报错：这类失败有明确的出路（去登录），不该被混在一句
@@ -167,6 +175,14 @@ def raise_business_error(endpoint: str, code: Any, desc: str) -> None:
     """
     if str(code) in NEED_LOGIN_CODES or any(h in desc for h in NEED_LOGIN_HINTS):
         raise NeedLoginError(endpoint, desc, code)
+    if endpoint == "/statuses/show.json":
+        missing = str(code) == "20210" or (
+            str(code) == "404" and desc.strip("。 ") in ("您访问的页面不存在", "帖子不存在", "帖子已删除")
+        )
+        if missing:
+            if status in (401, 403):
+                raise NeedLoginError(endpoint, desc, code)
+            raise PostNotFoundError(code, desc)
     raise XueqiuError(f"雪球接口 {endpoint} 报错：{desc or code}")
 
 
@@ -337,9 +353,13 @@ class XueqiuClient:
 
             if resp.status_code == 429:
                 raise RateLimitedError(path)
+            if path == "/statuses/show.json" and resp.is_server_error:
+                resp.raise_for_status()
 
             try:
-                data = self._decode_response(path, resp.content)
+                data = self._decode_response(path, resp)
+            except PostNotFoundError:
+                raise
             except NeedLoginError:
                 if attempt:
                     raise
@@ -358,14 +378,17 @@ class XueqiuClient:
         raise AssertionError("unreachable")
 
     @staticmethod
-    def _decode_response(path: str, raw: bytes) -> Any:
+    def _decode_response(path: str, response: httpx.Response) -> Any:
         # 只检查开头，避免为大 JSON 复制和解码整个响应体。
+        raw = response.content
         if raw[:32].lstrip()[:1] == b"<":
             raise NeedCookieError(path)
 
         try:
             data = _loads(raw)
         except ValueError as exc:  # pragma: no cover - 极少发生
+            if path == "/statuses/show.json" and response.status_code == 404:
+                response.raise_for_status()
             raise XueqiuError(
                 f"接口 {path} 返回了无法解析的内容：{raw[:200].decode('utf-8', 'replace')}"
             ) from exc
@@ -374,8 +397,10 @@ class XueqiuClient:
             code = data.get("error_code")
             if code not in (None, 0, "0"):
                 raise_business_error(
-                    path, code, str(data.get("error_description") or data.get("error_msg") or "")
+                    path, code, str(data.get("error_description") or data.get("error_msg") or ""), response.status_code
                 )
+            if path == "/statuses/show.json" and response.is_error:
+                response.raise_for_status()
             if data.get("status") and data.get("error") and "data" not in data:
                 raise XueqiuError(f"雪球接口 {path} 报错：{data.get('error')}（HTTP {data.get('status')}）")
         return data

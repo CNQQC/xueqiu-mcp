@@ -36,6 +36,8 @@ async def get_financial_statement(
 
     sym = await resolve_symbol(symbol)
     region = market_of(sym)
+    if region is None:
+        return f"{sym} 是板块指数，无公司财务报表。"
     market = _MARKET_PATH.get(region, "cn")
     title, mapping, brief = _MARKET_STATEMENTS[region][statement]
     count = max(1, min(int(count), 20))

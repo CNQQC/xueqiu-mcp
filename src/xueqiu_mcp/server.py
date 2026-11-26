@@ -124,20 +124,22 @@ async def get_kline(
     adjust: str = "before",
     with_valuation: bool = False,
     exclude_today: bool = False, format: OutputFormat = "markdown",
+    begin: str | int | None = None,
 ) -> CallToolResult:
     """历史 K 线，可选带上每根 K 线的 PE / PB / PS / 市值。
 
     Args:
         symbol: 股票代码
         period: 周期，1m/5m/15m/30m/60m/120m/day/week/month/quarter/year
-        count: 最近多少根 K 线，最多 500
+        count: 返回根数，最多 500
+        begin: 交易所当地起始日期 YYYY-MM-DD 或 Unix 毫秒时间戳，从该时刻起向后取数；省略时取最近 count 根
         exclude_today: 排除交易所当天及覆盖当天的未结束周期
         adjust: 复权方式，before 前复权 / after 后复权 / normal 不复权
         with_valuation: 为 true 时附带估值指标，适合做估值分位分析
     """
     value = await quote.get_kline(
         symbol, period, count, adjust, with_valuation,
-        exclude_today=exclude_today, format=format,
+        exclude_today=exclude_today, format=format, begin=begin,
     )
     return tool_result(value, format)
 
@@ -194,7 +196,7 @@ async def get_business_breakdown(symbol: str, count: int = 2, format: OutputForm
 # ------------------------------------------------------------------ 公司资料
 @mcp.tool()
 async def get_company_profile(symbol: str, format: OutputFormat = "markdown") -> CallToolResult:
-    """公司资料：简介、主营、实控人、员工数、所属行业与概念板块（仅 A 股）。
+    """公司资料与行业基准（仅 A 股）。industries[].kline_symbol 可直接传给 get_kline。
 
     Args:
         symbol: 股票代码
@@ -429,6 +431,7 @@ async def search_posts(
     original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
     exclude_content_hashes: list[str] | None = None,
+    cursor: str = "", enrich_symbols: bool = False,
 ) -> CallToolResult:
     """搜索雪球帖子及关键词附近原文摘录，可限定作者并校验作者 ID。
 
@@ -443,14 +446,17 @@ async def search_posts(
         exact_phrase: 在标题或可见正文（无正文时用摘要）中匹配完整连续短语
         deduplicate: 在当前结果页按规范化内容哈希去重，保留首条；JSON 提供 content_hash 便于跨页比对
         exclude_content_hashes: 排除之前已保存的非空 content_hash，可跨页或跨调用去重
+        enrich_symbols: JSON 模式下为没有关联标的的搜索结果查询帖子详情，每帖增加一次请求
         count: 条数，最多 30
-        page: 页码
+        page: 页码，兼容直接传入筛选游标
+        cursor: 筛选续读时原样传回 pagination.next_page（例如 p1r9），保留原筛选条件
         user_id: 雪球用户数字 ID 或主页/帖子链接，可先用 search_users 查找；不填则全站搜索
     """
     value = await social.search_posts(
         query, count, page, user_id,
         since_id=since_id, since=since, until=until, original_only=original_only, min_followers=min_followers, format=format,
         exact_phrase=exact_phrase, deduplicate=deduplicate, exclude_content_hashes=exclude_content_hashes,
+        cursor=cursor, enrich_symbols=enrich_symbols,
     )
     return tool_result(value, format)
 
@@ -463,6 +469,8 @@ async def get_post(
     """按帖子 ID 取全文及最新评论（按时间倒序）。ID 可从讨论列表或热帖列表中获得。
 
     返回发布时间、原始编辑字段和编辑状态。空值标为未编辑，字段缺失或值异常标为未知。
+    JSON 用 author_text 读取作者文字。回查可见性时读 availability；明确不存在为 not_found，
+    风控或网络错误为 unknown，具体原因见 error.code。回查可关闭 with_comments 和 full_text。
     正文残缺时（雪球置了 truncated，或正文为空的付费 / 仅粉丝可见内容）会用本机
     浏览器把完整正文取回来，需要装浏览器支持，没装就照常返回并给出提示。
 
@@ -478,7 +486,7 @@ async def get_post(
         post_id, with_comments, comment_count, full_text,
         comment_page=comment_page, format=format, page=page,
     )
-    return tool_result(value, format)
+    return tool_result(value, format, error=isinstance(value, dict) and "error" in value)
 
 
 @mcp.tool()
@@ -486,6 +494,7 @@ async def get_user_posts(
     user_id: str, count: int = 10, page: int | str = 1,
     since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
+    cursor: str = "",
 ) -> CallToolResult:
     """查看某位雪球用户的发帖动态，用于跟踪特定作者的观点。
 
@@ -495,11 +504,13 @@ async def get_user_posts(
     Args:
         user_id: 雪球用户数字 ID 或主页/帖子链接（xueqiu.com/<user_id>/<post_id>）
         count: 每页最多 30 条，超过 20 条自动分批获取，结果显示请求数和实返数
-        page: 页码
+        page: 页码，兼容直接传入筛选游标
+        cursor: 筛选续读时原样传回 pagination.next_page（例如 p1r14），保留原筛选条件
     """
     value = await social.get_user_posts(
         user_id, count, page,
         since_id=since_id, since=since, until=until, original_only=original_only, min_followers=min_followers, format=format,
+        cursor=cursor,
     )
     return tool_result(value, format)
 

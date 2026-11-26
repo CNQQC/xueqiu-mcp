@@ -6,14 +6,14 @@ import asyncio
 import re
 
 from .client import get_client
-from .symbols import is_resolvable, normalize_symbol
+from .symbols import BOARD_CODE, FUND_CODE, is_resolvable, normalize_symbol
 
 _SPLIT_RE = re.compile(r"[,，、;；\s]+")
 
 _STOCK_TYPE_NAME = {
     11: "A股", 12: "A股", 30: "港股", 31: "港股", 82: "科创板",
     0: "美股", 1: "美股", 2: "美股", 3: "美股", 5: "美股",
-    23: "美股", 6: "指数", 18: "指数", 26: "基金/ETF",
+    6: "指数", 18: "指数", 4: "基金/ETF", 13: "场内基金/ETF", 26: "基金/ETF",
 }
 
 
@@ -29,11 +29,17 @@ async def search(query: str, size: int = 10) -> list[dict]:
     out = []
     for it in items[:size]:
         code = it.get("code") or ""
+        if FUND_CODE.fullmatch(code):
+            asset_type = "场外基金"
+        elif BOARD_CODE.fullmatch(code):
+            asset_type = "板块指数"
+        else:
+            asset_type = _STOCK_TYPE_NAME.get(it.get("stock_type"), "其他")
         out.append(
             {
                 "symbol": code,
                 "name": it.get("query") or "",
-                "type": _STOCK_TYPE_NAME.get(it.get("stock_type"), "其他"),
+                "type": asset_type,
             }
         )
     return out

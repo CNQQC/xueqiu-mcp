@@ -10,6 +10,10 @@ from .formatting import CN_TZ, post_url, strip_html
 from .results import iso_time
 
 _STOCK = re.compile(r"\$([^$()\n（）]+)[(（]([A-Za-z0-9.\-]+)[)）]\$")
+_STOCK_LINK = re.compile(
+    r"""<a\b[^>]*?\s+href\s*=\s*["'](?:(?:https?:)?//(?:www\.)?xueqiu\.com)?/S/"""
+    r"""([A-Z0-9.\-]+)(?:[?#][^"']*)?["'][^>]*>(.*?)</a\s*>""", re.I | re.S)
+_CODE = re.compile(r"[A-Z0-9.][A-Z0-9.\-]*", re.ASCII)
 _MENTIONS = re.compile(r"(?:@[^@\s:：/,，]+[\s,，]*)+")
 
 
@@ -57,16 +61,50 @@ def edit_fields(post: dict) -> dict:
             "edited_at_present": present, "edited_after_creation": later}
 
 
+def _post_symbols(post, title, text):
+    by_code = {}
+
+    def add(code, name, source):
+        if isinstance(code, str) and _CODE.fullmatch(code.upper()):
+            code = code.upper()
+            by_code.setdefault(code, {"code": code, "name": name or None, "source": source})
+
+    for raw in (post.get("title"), post.get("text"), post.get("description")):
+        if raw:
+            for code, label in _STOCK_LINK.findall(raw):
+                label = strip_html(label).strip("$")
+                name = re.sub(r"[（(]" + re.escape(code) + r"[)）]$", "", label, flags=re.I)
+                add(code, name, "link")
+    description = strip_html(post.get("description"))
+    for name, code in _STOCK.findall("\n".join((title, text, description))):
+        add(code, name.strip(), "text")
+    # tagsForWeb 的分号后是雪球显式标记的股票代码，前段可能是普通主题。
+    tags = post.get("tagsForWeb")
+    if isinstance(tags, str):
+        for code in tags.partition(";")[2].split(","):
+            add(code.strip(), None, "tagsForWeb")
+    for entry in post.get("stock_list") or []:
+        if isinstance(entry, dict):
+            add(entry.get("symbol"), entry.get("name"), "stock_list")
+    correlations = post.get("stockCorrelation")
+    if isinstance(correlations, list):
+        for code in correlations:
+            add(code, None, "stockCorrelation")
+    return list(by_code.values())
+
+
+def _original_id(post):
+    pid = (post.get("retweeted_status") or {}).get("id") or post.get("retweet_status_id")
+    return None if pid in (0, -1, "0", "-1", "") else pid
+
+
 def post_record(post: dict) -> dict:
     user = post.get("user") or {}
     original = post.get("retweeted_status") or {}
-    original_id = original.get("id") or post.get("retweet_status_id")
-    if original_id in (0, -1, "0", "-1", ""):
-        original_id = None
+    original_id = _original_id(post)
     author_id = post.get("user_id") or user.get("id")
     text = strip_html(post.get("text")) or strip_html(post.get("description"))
     title = strip_html(post.get("title"))
-    symbols = list(dict.fromkeys((name.strip(), code.upper()) for name, code in _STOCK.findall(title + "\n" + text)))
     own, *quoted = re.split(r"//\s*@", text, maxsplit=1)
     return {
         "id": str(post["id"]) if post.get("id") is not None else None,
@@ -77,9 +115,9 @@ def post_record(post: dict) -> dict:
         "retweeted_status": ({"id": str(original_id) if original_id else None,
                               "created_at": iso_time(original.get("created_at")), **edit_fields(original)}
                              if original else None),
-        "title": title, "text": text, "author_text": own.strip(),
+        "title": title, **({"text": text} if original_id or original or quoted else {}), "author_text": own.strip(),
         "quoted_text": "//@" + quoted[0] if quoted else None, "url": post_url(post),
-        "symbols": [{"name": name, "code": code} for name, code in symbols],
+        "symbols": _post_symbols(post, title, text),
         **{key: _integer(post.get(key)) for key in ("like_count", "reply_count", "retweet_count", "view_count")},
     }
 
@@ -121,8 +159,8 @@ def filter_posts(rows, since_id, since, until, original_only, min_followers):
         if min_followers is not None and (fans is None or fans < min_followers):
             continue
         if original_only:
-            rec = post_record(row)
-            if rec["is_retweet"] or rec["quoted_text"] or _MENTIONS.fullmatch(rec["text"]):
+            body = strip_html(row.get("text")) or strip_html(row.get("description"))
+            if _original_id(row) or row.get("retweeted_status") or re.search(r"//\s*@", body) or _MENTIONS.fullmatch(body):
                 continue
         selected.append(row)
     return selected

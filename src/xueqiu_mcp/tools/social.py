@@ -14,12 +14,11 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-from ..client import APP_API, XueqiuError, get_client
+from ..client import APP_API, NeedCookieError, NeedLoginError, PostNotFoundError, RateLimitedError, XueqiuError, get_client
 from ..formatting import fmt_count, fmt_ts, post_url, strip_html
 from ..posts import content_hash, edit_fields, filter_posts, post_record, search_text
 from ..results import iso_time, pagination, page_text, records
@@ -455,12 +454,29 @@ async def _read_filtered(path, params, key, size, page, uid, filters):
     return selected, meta, " ".join(notes)
 
 
+async def _read_post_list(path, params, key, size, page, cursor, uid, filters):
+    if cursor:
+        if str(page) not in ("1", cursor):
+            raise ValueError("cursor 与 page 指定了不同的续读位置。")
+        if not re.fullmatch(r"p[0-9]+r[0-9]+", cursor):
+            raise ValueError("cursor 需要上次返回的筛选游标。")
+        page = cursor
+    since_id, since, until, original_only, min_followers = filters
+    if original_only or any(x is not None for x in (since_id, since, until, min_followers)):
+        return await _read_filtered(path, params, key, size, page, uid, filters)
+    if not str(page).isascii() or not str(page).isdigit():
+        raise ValueError("普通分页需要整数页码；使用筛选游标时请保留原筛选条件。")
+    return await _fetch_post_page(path, params, key, size, max(1, int(page)), REFERER,
+                                  fixed_batch=10 if key == "list" else None)
+
+
 async def search_posts(
     query: str, count: int = 10, page: int | str = 1, user_id: str | None = None,
     since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: str = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
     exclude_content_hashes: list[str] | None = None,
+    cursor: str = "", enrich_symbols: bool = False,
 ) -> str | dict:
     query = query.strip()
     if not query:
@@ -477,14 +493,10 @@ async def search_posts(
         params["uid"] = uid
         path = "/query/v1/user/status/search.json"
     filters = (since_id, since, until, original_only, min_followers)
-    if any(x is not None for x in (since_id, since, until, min_followers)) or original_only:
-        try:
-            raw, meta, note = await _read_filtered(path, params, "list", size, page, uid, filters)
-        except ValueError as exc:
-            return str(exc)
-    else:
-        page = max(1, int(page))
-        raw, meta, note = await _fetch_post_page(path, params, "list", size, page, REFERER, fixed_batch=10)
+    try:
+        raw, meta, note = await _read_post_list(path, params, "list", size, page, cursor, uid, filters)
+    except ValueError as exc:
+        return str(exc)
     scope = f"用户 {uid} 的" if uid else ""
     title = f"{scope}「{query}」相关帖子"
     verified = [p for p in raw if _is_author(p, uid)] if uid else raw
@@ -492,9 +504,25 @@ async def search_posts(
     if rejected:
         note += f" 已排除 {rejected} 条无法通过作者身份校验的结果。"
     note += " 以下为关键词附近摘录；引用前请用 get_post 获取全文并核对上下文。"
-    return _filtered_page(verified, meta, note, title, count, query, format,
-                          exact_phrase=exact_phrase, deduplicate=deduplicate,
-                          exclude_hashes={h.lower() for h in (exclude_content_hashes or [])})
+    result = _filtered_page(verified, meta, note, title, count, query, format,
+                            exact_phrase=exact_phrase, deduplicate=deduplicate,
+                            exclude_hashes={h.lower() for h in (exclude_content_hashes or [])})
+    if enrich_symbols and format == "json":
+        # 搜索摘要经常缺失时间线里的 stockCorrelation，仅为最终入选且没有标的的帖子读详情。
+        gate = asyncio.Semaphore(3)
+
+        async def supplement(item):
+            async with gate:
+                detail = await get_post(item["id"], with_comments=False, full_text=False, format="json")
+            if detail.get("availability") == "available":
+                item["symbols"] = detail["post"]["symbols"]
+                item["symbols_lookup"] = "detail"
+            else:
+                item["symbols_lookup"] = detail["error"]["code"]
+
+        missing = [item for item in result["items"] if not item["symbols"] and (item["id"] or "").isdigit()]
+        await asyncio.gather(*(supplement(item) for item in missing))
+    return result
 
 
 def _filtered_page(posts, meta, note, title, requested, query, format, *,
@@ -611,11 +639,23 @@ async def get_post(
             )
         )
     fetched = await asyncio.gather(*tasks, return_exceptions=True)
-    if isinstance(fetched[0], BaseException):
-        raise fetched[0]
-    st: dict[str, Any] = fetched[0]
-    if not st.get("id"):
-        return f"未找到 ID 为 {pid} 的帖子。"
+    st = fetched[0]
+    if isinstance(st, (XueqiuError, httpx.HTTPError)):
+        codes = ((PostNotFoundError, "post_not_found"), (NeedCookieError, "waf_blocked"),
+                 (NeedLoginError, "login_required"), (RateLimitedError, "rate_limited"),
+                 (httpx.TimeoutException, "timeout"), (httpx.RequestError, "network_error"))
+        code = next((value for error, value in codes if isinstance(st, error)), "upstream_error")
+        error = {"code": code, "message": str(st) or type(st).__name__}
+        if isinstance(st, PostNotFoundError):
+            error["upstream_code"] = st.upstream_code
+        if isinstance(st, httpx.HTTPStatusError):
+            error["http_status"] = st.response.status_code
+        return {"post_id": pid, "availability": "not_found" if code == "post_not_found" else "unknown", "error": error}
+    if isinstance(st, BaseException):
+        raise st
+    if not isinstance(st, dict) or str(st.get("id")) != pid:
+        return {"post_id": pid, "availability": "unknown",
+                "error": {"code": "invalid_response", "message": f"雪球没有返回与 {pid} 匹配的帖子。"}}
 
     note = ""
     if full_text and _looks_truncated(st):
@@ -647,7 +687,7 @@ async def get_post(
             if len(comments) < size:
                 comment_note = "当前评论页返回的评论少于请求数。"
     if format == "json":
-        return {"post": post_record(st), "comments": [post_record(c) for c in comments],
+        return {"availability": "available", "post": post_record(st), "comments": [post_record(c) for c in comments],
                 "comment_sort": "time_desc" if with_comments else None,
                 "pagination": meta, "note": (note.strip() + " " + comment_note).strip()}
 
@@ -684,6 +724,7 @@ async def get_user_posts(
     user_id: str, count: int = 10, page: int | str = 1, since_id: str | int | None = None,
     since: str | None = None, until: str | None = None, original_only: bool = False,
     min_followers: int | None = None, format: str = "markdown",
+    cursor: str = "",
 ) -> str | dict:
     uid = _user_id(user_id)
     if not uid:
@@ -691,14 +732,10 @@ async def get_user_posts(
     size = max(1, min(int(count), 30))
     path, params = "/v4/statuses/user_timeline.json", {"user_id": uid}
     filters = (since_id, since, until, original_only, min_followers)
-    if any(x is not None for x in (since_id, since, until, min_followers)) or original_only:
-        try:
-            raw, meta, note = await _read_filtered(path, params, "statuses", size, page, uid, filters)
-        except ValueError as exc:
-            return str(exc)
-    else:
-        page = max(1, int(page))
-        raw, meta, note = await _fetch_post_page(path, params, "statuses", size, page, REFERER)
+    try:
+        raw, meta, note = await _read_post_list(path, params, "statuses", size, page, cursor, uid, filters)
+    except ValueError as exc:
+        return str(exc)
     posts = [p for p in raw if _is_author(p, uid)]
     if len(posts) < len(raw):
         note += f" 已排除 {len(raw) - len(posts)} 条作者不符或身份不明的动态。"

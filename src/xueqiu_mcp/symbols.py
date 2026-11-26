@@ -21,6 +21,8 @@ _DIGITS_6 = re.compile(r"^\d{6}$")
 _PREFIXED = re.compile(r"^(SH|SZ|BJ)(\d{6})$", re.IGNORECASE)
 _HK = re.compile(r"^(?:HK)?(\d{1,5})$", re.IGNORECASE)
 _US = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+BOARD_CODE = re.compile(r"BK[0-9]{4,}", re.I)
+FUND_CODE = re.compile(r"F[0-9]{6}", re.I)
 
 
 def _exchange_for_6digit(code: str) -> str:
@@ -94,9 +96,11 @@ def parse_symbols(raw: str | list[str]) -> list[str]:
     return [normalize_symbol(p) for p in parts if p and p.strip()]
 
 
-def market_of(symbol: str) -> str:
-    """返回 symbol 所属市场：CN / HK / US。"""
-    if _PREFIXED.match(symbol):
+def market_of(symbol: str) -> str | None:
+    """BK 板块覆盖多个市场，归属需要行情快照确认。"""
+    if BOARD_CODE.fullmatch(symbol):
+        return None
+    if _PREFIXED.match(symbol) or FUND_CODE.fullmatch(symbol):
         return "CN"
     if re.match(r"^\d{5}$", symbol):
         return "HK"

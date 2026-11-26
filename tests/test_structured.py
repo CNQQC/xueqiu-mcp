@@ -4,10 +4,13 @@ import unittest
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
-from xueqiu_mcp import server
+import httpx
+
+from xueqiu_mcp import resolve, server
+from xueqiu_mcp.client import XueqiuClient
 from xueqiu_mcp.formatting import CN_TZ
 from xueqiu_mcp.posts import filter_posts, post_record
-from xueqiu_mcp.tools import social
+from xueqiu_mcp.tools import f10, quote, social
 from xueqiu_mcp.trading import partial_bar
 
 
@@ -18,6 +21,9 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
         for tool in tools:
             schema = tool.model_dump(by_alias=True)["inputSchema"]["properties"]
             self.assertEqual("format" in schema, tool.name not in mutating, tool.name)
+            if tool.name in ("search_posts", "get_user_posts"):
+                self.assertEqual(schema["cursor"]["type"], "string")
+                self.assertEqual({v["type"] for v in schema["page"]["anyOf"]}, {"integer", "string"})
 
     async def test_thirty_three_comments_are_reachable(self):
         async def fetch(path, params, **kwargs):
@@ -58,6 +64,126 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
                 page = result["pagination"]["next_page"]
         self.assertEqual(ids, [i for i in range(5, 31) if i % 3])
 
+    async def test_cursor_alias_and_conflict_on_both_tools(self):
+        client = AsyncMock()
+        rows = [{"id": i, "user_id": 123, "text": f"原文 {i}"} for i in range(10)]
+        client.get.return_value = {"list": rows, "statuses": rows, "maxPage": 1, "page": 1}
+        with patch.object(social, "get_client", return_value=client):
+            for tool, arg in ((server.search_posts, "市场"), (server.get_user_posts, "123")):
+                kw = dict(count=3, original_only=True, format="json")
+                first = await tool(arg, **kw)
+                token = json.loads(first.content[0].text)["pagination"]["next_page"]
+                second = await tool(arg, cursor=token, **kw)
+                self.assertEqual([p["id"] for p in json.loads(second.content[0].text)["items"]], ["3", "4", "5"])
+                self.assertEqual(second.content, (await tool(arg, page=token, **kw)).content)
+                self.assertTrue((await tool(arg, page=2, cursor=token, **kw)).model_dump(by_alias=True)["isError"])
+
+    async def test_search_symbol_enrichment_only_reads_missing_records(self):
+        client = AsyncMock()
+        client.get.side_effect = [{"list": [{"id": 1, "text": "$茅台(SH600519)$"}, {"id": 2, "text": "药明"}]},
+                                  {"id": 2, "text": "药明", "stockCorrelation": ["SH603259"]}]
+        with patch.object(social, "get_client", return_value=client):
+            rows = (await social.search_posts("市场", count=2, enrich_symbols=True, format="json"))["items"]
+        self.assertNotIn("symbols_lookup", rows[0])
+        self.assertEqual(rows[1]["symbols"], [{"name": None, "code": "SH603259", "source": "stockCorrelation"}])
+        self.assertEqual(rows[1]["symbols_lookup"], "detail")
+        self.assertEqual(client.get.await_count, 2)
+
+    def test_symbol_sources_and_quoted_text(self):
+        row = post_record({"text": "药明//@原作者: 看好", "description": '<a href="/S/00700">腾讯</a>',
+                           "stock_list": [{"symbol": "00700"}, {"symbol": "MU"}],
+                           "stockCorrelation": ["MU", "SH603259", ".IXIC"]})
+        self.assertEqual(row["author_text"], "药明")
+        self.assertEqual(row["quoted_text"], "//@原作者: 看好")
+        self.assertEqual(row["text"], "药明//@原作者: 看好")
+        self.assertEqual([i["code"] for i in row["symbols"]], ["00700", "MU", "SH603259", ".IXIC"])
+        self.assertEqual(row["symbols"][0], {"name": "腾讯", "code": "00700", "source": "link"})
+        self.assertEqual(post_record({"text": "宁德 药明 中际"})["symbols"], [])
+
+    async def test_post_unavailability_is_only_confirmed_by_business_response(self):
+        cases = [
+            (httpx.Response(400, json={"error_code": "20210"}), "post_not_found"),
+            (httpx.Response(404, json={"error_code": "404", "error_description": "帖子已删除"}), "post_not_found"),
+            (httpx.Response(404, json={"error": "Not Found"}), "upstream_error"),
+            (httpx.Response(403, text="<html>challenge</html>"), "waf_blocked"),
+            (httpx.Response(503, json={"error_code": "20210"}), "upstream_error"),
+            (httpx.Response(401, json={"error_code": "10022"}), "login_required"),
+            (httpx.Response(429), "rate_limited"), (httpx.ReadTimeout("read"), "timeout"),
+            (httpx.ConnectError("connect"), "network_error"),
+            (httpx.Response(200, json={"id": "101"}), "invalid_response"),
+        ]
+        for response, code in cases:
+            with self.subTest(code=code):
+                def respond(request):
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+                client = XueqiuClient(user_cookie="xq_a_token=test", cache_enabled=False)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client._client:
+                    with patch.object(social, "get_client", return_value=client):
+                        result = await server.get_post("99", with_comments=False, format="json")
+                wire = result.model_dump(by_alias=True)
+                self.assertTrue(wire["isError"])
+                data = wire["structuredContent"]
+                self.assertEqual(data, json.loads(result.content[0].text))
+                self.assertEqual(data["error"]["code"], code)
+                self.assertEqual(data["availability"], "not_found" if code == "post_not_found" else "unknown")
+
+    async def test_historical_board_windows_use_exchange_zone_and_positive_count(self):
+        client = AsyncMock()
+        async def fetch(path, params):
+            sym = params["symbol"]
+            if path == quote.KLINE_PATH:
+                return {"data": {"column": ["timestamp", "close"], "item": [[params["begin"], 1]]}}
+            return {"data": {"items": [{"quote": {"symbol": sym}, "market": {
+                "region": "CN" if sym == "BK0088" else "US"}}]}}
+        client.get.side_effect = fetch
+        with patch.object(quote, "get_client", return_value=client):
+            for sym, offset in (("BK0088", "+08:00"), ("BK1499", "-05:00")):
+                data = await quote.get_kline(sym, begin="2024-11-25", count=65, with_valuation=True,
+                                             exclude_today=True, format="json")
+                stamp = data["items"][0]["timestamp"]
+                self.assertEqual(stamp, "2024-11-25T00:00:00" + offset)
+                self.assertFalse(data["items"][0]["is_partial"])
+                self.assertEqual(client.get.call_args.args[1]["count"], 65)
+                ms = int(datetime.fromisoformat(stamp).timestamp() * 1000)
+                repeated = await quote.get_kline(sym, begin=ms, count=65, with_valuation=True, format="json")
+                self.assertEqual(repeated["items"], data["items"])
+                later = await quote.get_kline(sym, begin=ms + 1, count=3, format="json")
+                self.assertEqual(later["items"][0]["timestamp"], "2024-11-26T00:00:00" + offset)
+
+    async def test_extended_quote_fields_follow_each_session(self):
+        client = AsyncMock()
+        items = [{"market": {"status": status}, "quote": {
+            "symbol": sym, "current": 123, "current_ext": 123, "percent_ext": 0}}
+                 for sym, status in (("SH600519", "交易中"), ("AAPL", "盘后交易"))]
+        client.get.return_value = {"data": {"items": items}}
+        with patch.object(quote, "get_client", return_value=client):
+            rows = (await quote.get_quote("SH600519,AAPL", detail=True, format="json"))["items"]
+            blocks = (await quote.get_quote("SH600519,AAPL", detail=True)).split("### ")
+        self.assertNotIn("current_ext", rows[0])
+        self.assertNotIn("percent_ext", rows[0])
+        self.assertEqual(rows[1]["percent_ext"], 0)
+        self.assertNotIn("盘后价", blocks[1])
+        self.assertIn("盘后价", blocks[2])
+        self.assertIn("current_ext", items[0]["quote"])
+
+    async def test_fund_search_and_industry_benchmark_keep_asset_identity(self):
+        client = AsyncMock()
+        client.get.return_value = {"data": [{"code": "F161725", "stock_type": 23},
+                                            {"code": "BK0088", "stock_type": 81},
+                                            {"code": "AAPL", "stock_type": 0}]}
+        with patch.object(resolve, "get_client", return_value=client):
+            rows = (await quote.search_stock("白酒", format="json"))["items"]
+        self.assertEqual([r["type"] for r in rows], ["场外基金", "板块指数", "美股"])
+        industry = {"industry": [{"ind_name": "白酒", "ind_code": "BK0088"},
+                                 {"ind_name": "其他", "ind_code": "S3405"}]}
+        client.get.side_effect = [{"data": {"company": {"org_name_cn": "测试"}}}, {"data": industry}] * 2
+        with patch.object(f10, "get_client", return_value=client):
+            rows = (await f10.get_company_profile("SH600519", format="json"))["industries"]
+            self.assertIn("BK0088", await f10.get_company_profile("SH600519"))
+        self.assertEqual([r["kline_symbol"] for r in rows], ["BK0088", None])
+
     async def test_hot_cards_cursor_and_non_post_cards(self):
         client = AsyncMock()
         def feed(ids):
@@ -74,7 +200,9 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
         raw = {"id": 9007199254740993, "user_id": 123, "created_at": 1780363943000,
                "text": "$茅台(SH600519)$ $茅台(SH600519)$", "like_count": 14375, "view_count": 0}
         result = post_record(raw)
-        self.assertEqual(result["symbols"], [{"name": "茅台", "code": "SH600519"}])
+        self.assertEqual(result["symbols"], [{"name": "茅台", "code": "SH600519", "source": "text"}])
+        self.assertNotIn("text", result)
+        self.assertEqual(result["author_text"], raw["text"])
         self.assertEqual(result["id"], "9007199254740993")
         self.assertEqual(result["like_count"], 14375)
         self.assertEqual(result["view_count"], 0)

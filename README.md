@@ -183,6 +183,7 @@ search_posts(query="茅台", count=30, since="2026-01-01", until="2026-11-26", o
 get_user_posts(user_id="1422017996", since_id="400000000", count=30, format="json")
 get_post(post_id="392261408", comment_count=30, page=2, format="json")
 get_kline(symbol="SH600519", period="day", count=20, exclude_today=true, format="json")
+get_kline(symbol="BK0088", period="day", begin="2024-11-23", count=65, format="json")
 get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
 ```
 
@@ -191,7 +192,15 @@ get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
 - `since_id` 为排他下界。`since` 包含起点，`until` 若为时间则不含终点，若为日期则包含当日。无时区输入按北京时间解释。`original_only` 排除带转发标记、内联转述或正文仅有 @ 提及的记录。`min_followers` 指作者粉丝数，粉丝数缺失时无法通过该条件。
 - K 线、资金流的 `as_of` 是工具观测时间，`quote_as_of` 是行情快照时间。`is_partial=null` 表示现有市场状态不足以确认。`exclude_today=true` 按交易所当地日期排除当天，周、月、季、年 K 线同时排除覆盖当天的周期。资金累计按日期筛选后重新求和，不足完整窗口时金额为 `null`。
 
-如果客户端的工具列表缺少 `get_user_profile` 或 `get_post.page`，请重新连接该 MCP 并刷新工具清单。在保留旧清单的会话中，可以新建会话重新获取参数。
+筛选后的 `search_posts` 和 `get_user_posts` 可将字符串 `pagination.next_page` 原样传给 `cursor`，例如 `cursor="p1r14"`。保留原查询条件和条数，普通整数页码继续用 `page`。
+
+**观点与标的**　读取作者文字统一用 `author_text`。原创且没有内联引用的帖子省略重复的 `text`，转发或含引用的帖子保留完整 `text` 和拆分字段。`symbols[].source` 说明代码来自股票链接、正文标签或雪球元数据。`stockCorrelation` 是雪球对整帖的关联，可能包含多个上市地或引用内容。搜帖摘要缺少代码时，可用 `search_posts(..., enrich_symbols=true, format="json")` 按需读取详情；`symbols_lookup` 记录补查结果。纯文字简称在缺少标记和关联数据时返回空数组。
+
+**历史行业基准**　将 `get_company_profile` 返回的 `industries[].kline_symbol` 传给 `get_kline`；`list_industries` 的行业编码供选股器使用。`begin` 接受交易所当地日期或 Unix 毫秒时间戳，返回从起点开始、按时间升序排列的最多 `count` 根，非交易日起点顺延。省略 `begin` 时取最近的窗口。`BK` 指数覆盖 A 股、港股和美股，时区取自行情快照。
+
+**回查帖子**　用 `get_post(..., with_comments=false, full_text=false, format="json")` 查可见性。成功时 `availability="available"`。失败时 MCP 的 `isError=true`，详情见 `structuredContent.error.code`。雪球明确回复帖子不存在时，返回 `post_not_found` 和 `availability="not_found"`，删除原因及操作者仍未知。`waf_blocked`、`rate_limited`、`login_required`、`timeout`、`network_error`、`upstream_error` 和 `invalid_response` 均返回 `availability="unknown"`。评论读取失败时保留正文及其可见状态。
+
+如果客户端的工具列表缺少 `get_kline.begin` 或 `search_posts.cursor`，请确认服务已更新，重新连接并刷新工具清单。
 
 ## 工具一览
 

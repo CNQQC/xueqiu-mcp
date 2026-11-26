@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import time
+from datetime import date, datetime, time as wall_time, timedelta
 from typing import Any
 
 from ..cache import ttl_for
-import asyncio
 
 from ..client import get_client
 from ..results import field_unit, iso_time, records, select_fields
-from ..trading import market_zone, partial_bar, period_end, read_observation
-from datetime import datetime, time as wall_time
+from ..trading import partial_bar, period_end, read_observation
 from ..fields import QUOTE_BRIEF, QUOTE_FIELDS
 from ..formatting import (
     fmt_money,
@@ -59,6 +60,9 @@ async def get_quote(symbols: str, detail: bool = False, format: str = "markdown"
     for item in (data.get("data") or {}).get("items") or []:
         q = (item or {}).get("quote") or {}
         if q.get("symbol") and (q.get("name") or q.get("current") is not None):
+            if (item.get("market") or {}).get("status") not in ("盘后", "盘后交易", "盘后交易中", "盘后固定价格交易"):
+                q = {k: v for k, v in q.items() if k not in ("current_ext", "percent_ext")}
+                item = {**item, "quote": q}
             by_symbol[q["symbol"]] = item
     items = [by_symbol[s] for s in syms if s in by_symbol]
     missing.extend(s for s in syms if s not in by_symbol)
@@ -92,12 +96,24 @@ async def get_quote(symbols: str, detail: bool = False, format: str = "markdown"
         skip = {"名称", "代码", "现价", "涨跌幅"}
         blocks.append(head + "\n" + kv_block([p for p in pairs if p[0] not in skip]))
 
-    note = ""
-    if any((it.get("quote") or {}).get("current_ext") for it in items):
-        note = "\n\n注：带「盘后价」的标的处于盘后交易时段。"
     if warning:
         blocks.append(warning)
-    return "\n\n".join(blocks) + note
+    return "\n\n".join(blocks)
+
+
+def _begin_ms(value: str | int, zone, period: str) -> int:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return int(datetime.combine(date.fromisoformat(value), wall_time.min, zone).timestamp() * 1000)
+    if not re.fullmatch(r"-?[0-9]+", str(value)):
+        raise ValueError("invalid begin")
+    ms = int(value)
+    start = datetime.fromtimestamp(ms / 1000, zone)
+    if period.endswith("m"):
+        return -(-ms // 60_000) * 60_000
+    # 日及更长周期按当地零点标记。雪球会忽略 begin 的时分，直接取当天将少返回一根合格 K 线。
+    if start.time() != wall_time.min:
+        start = datetime.combine(start.date() + timedelta(days=1), wall_time.min, zone)
+    return int(start.timestamp() * 1000)
 
 
 async def get_kline(
@@ -107,8 +123,9 @@ async def get_kline(
     adjust: str = "before",
     with_valuation: bool = False,
     exclude_today: bool = False, format: str = "markdown",
+    begin: str | int | None = None,
 ) -> str | dict:
-    """历史 K 线。count 为最近 N 根，可选带上 PE/PB/市值。"""
+    """省略 begin 返回最近 N 根，指定交易所日期或毫秒时间戳则向后取 N 根。"""
     sym = await resolve_symbol(symbol)
     period = KLINE_PERIODS.get(period, period)
     if period not in KLINE_PERIODS:
@@ -123,33 +140,37 @@ async def get_kline(
     # begin 若用毫秒级当前时间，每次调用的 cache key 都不一样，K 线缓存会 100% 落空，
     # 还会把大条目不断塞进缓存挤掉别的端点。量化到 TTL 边界即可，返回数据完全相同。
     step = max(1.0, ttl_for(KLINE_PATH))
-    begin = int(time.time() // step * step * 1000)
-
-    zone = market_zone(sym)
-    today = datetime.now(zone).date()
-    if exclude_today:
-        begin = int(datetime.combine(today, wall_time.min, zone).timestamp() * 1000) - 1
     client = get_client()
-    data, (snapshot, observed, zone) = await asyncio.gather(client.get(
-        KLINE_PATH,
-        {
-            "symbol": sym,
-            "begin": begin,
-            "period": period,
-            "type": adjust,
-            # 不同 count 的上游估值覆盖可能不同。估值请求共用完整窗口，再按需截取。
-            "count": -500 if with_valuation else -min(500, count + int(exclude_today)),
-            "indicator": indicator,
-        },
-    ), read_observation(client, sym))
+    params = {
+        "symbol": sym, "period": period, "type": adjust, "indicator": indicator,
+        "begin": int(time.time() // step * step * 1000),
+        "count": -500 if with_valuation else -min(500, count + int(exclude_today)),
+    }
+    if begin is not None or exclude_today:
+        snapshot, observed, zone = await read_observation(client, sym)
+        if begin is not None:
+            try:
+                params["begin"] = _begin_ms(begin, zone, period)
+            except (ValueError, OverflowError, OSError):
+                return "begin 需要 YYYY-MM-DD 交易所当地日期或 Unix 毫秒时间戳。"
+            params["count"] = count
+        else:
+            params["begin"] = int(datetime.combine(observed.date(), wall_time.min, zone).timestamp() * 1000) - 1
+        data = await client.get(KLINE_PATH, params)
+    else:
+        data, (snapshot, observed, zone) = await asyncio.gather(
+            client.get(KLINE_PATH, params), read_observation(client, sym))
     d = data.get("data") or {}
     cols: list[str] = d.get("column") or []
     items: list[list] = d.get("item") or []
+    if begin is not None and items:
+        ts_index = cols.index("timestamp")
+        items = [row for row in items if row[ts_index] >= params["begin"]]
     if exclude_today and "timestamp" in cols:
         ts_index = cols.index("timestamp")
         items = [row for row in items if (stamp := iso_time(row[ts_index], zone))
-                 and period_end(datetime.fromisoformat(stamp).date(), period) < today]
-    items = items[-count:]
+                 and period_end(datetime.fromisoformat(stamp).date(), period) < observed.date()]
+    items = items[:count] if begin is not None else items[-count:]
 
     idx = {c: i for i, c in enumerate(cols)}
     show = ["timestamp", "open", "high", "low", "close", "percent", "volume", "amount", "turnoverrate"]
@@ -174,7 +195,7 @@ async def get_kline(
         units = {c: ("percent" if c in ("percent", "turnoverrate") else "shares" if c == "volume" else
                      "multiple" if c in ("pe", "pb", "ps") else money) for c in show if c != "timestamp"}
         return records(bars, requested, 500, symbol=sym, period=period, adjust=adjust, exclude_today=exclude_today,
-                       units=units, is_partial=partial, **snapshot)
+                       begin=begin, units=units, is_partial=partial, **snapshot)
     if not items:
         return f"{sym} 无符合条件的 K 线数据。"
     tf = "%Y-%m-%d" if period in ("day", "week", "month", "quarter", "year") else "%m-%d %H:%M"
@@ -184,7 +205,7 @@ async def get_kline(
         for c in show:
             v = cell(row, c)
             if c == "timestamp":
-                cells.append(fmt_ts(v, tf))
+                cells.append(datetime.fromtimestamp(v / 1000, zone).strftime(tf))
             elif c == "percent":
                 cells.append(fmt_pct(v, signed=True))
             elif c == "volume":
@@ -199,8 +220,9 @@ async def get_kline(
 
     first, last = items[0][idx["close"]], items[-1][idx["close"]]
     chg = (last - first) / first * 100 if first else 0
+    window = f"自 {begin} 起" if begin is not None else "最近"
     title = (
-        f"### {d.get('symbol', sym)} {period} K线（{ADJUST_TYPES.get(adjust, adjust)}，最近 {len(rows)} 根）\n"
+        f"### {d.get('symbol', sym)} {period} K线（{ADJUST_TYPES.get(adjust, adjust)}，{window} {len(rows)} 根）\n"
         f"区间：{rows[0][0]} ~ {rows[-1][0]}　收盘 {fmt_num(first, 3)} → {fmt_num(last, 3)}"
         f"　区间涨跌 {fmt_pct(chg, signed=True)}\n"
     )
@@ -222,7 +244,7 @@ async def get_minute(symbol: str, period: str = "1d", format: str = "markdown") 
     items = (d.get("items") or []) + (d.get("after") or [])
     if format == "json":
         from ..symbols import market_of
-        currency = d.get("currency") or {"CN": "CNY", "HK": "HKD", "US": "USD"}[market_of(sym)]
+        currency = d.get("currency") or {"CN": "CNY", "HK": "HKD", "US": "USD"}.get(market_of(sym))
         keys = ("timestamp", "current", "avg_price", "percent", "volume", "amount")
         return records([select_fields(i, keys, dates={"timestamp"}) for i in items], symbol=sym, period=period,
                        last_close=d.get("last_close"), units={"current": currency, "avg_price": currency,

@@ -8,6 +8,7 @@ from ..client import gather_json, get_client
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, fmt_ts, md_table
 from ..resolve import resolve_symbol
 from ..results import iso_time, records, select_fields
+from ..symbols import BOARD_CODE
 
 _COMPANY_LAYOUT = [
     ("org_name_cn", "公司全称"), ("org_short_name_cn", "简称"), ("org_name_en", "英文名"),
@@ -34,11 +35,13 @@ async def get_company_profile(symbol: str, format: str = "markdown") -> str | di
     if isinstance(data, BaseException):
         raise data
     c = (data.get("data") or {}).get("company") or {}
+    ind = {} if isinstance(ind_raw, BaseException) else ind_raw.get("data") or {}
+    industries = [{**row, "kline_symbol": row["ind_code"] if BOARD_CODE.fullmatch(row.get("ind_code") or "") else None}
+                  for row in ind.get("industry") or []]
     if format == "json":
         keys = [k for k, _ in _COMPANY_LAYOUT] + ["main_operation_business", "org_cn_introduction", "operating_scope"]
-        ind = {} if isinstance(ind_raw, BaseException) else ind_raw.get("data") or {}
         return {"symbol": sym, "company": select_fields(c, keys, dates={"established_date", "listed_date"}),
-                "industries": ind.get("industry") or [], "concepts": ind.get("concept") or [],
+                "industries": industries, "concepts": ind.get("concept") or [],
                 "units": {"reg_asset": "CNY", "staff_num": "people"}}
     if not c:
         return f"{sym} 无公司资料（该接口仅覆盖 A 股）。"
@@ -65,11 +68,11 @@ async def get_company_profile(symbol: str, format: str = "markdown") -> str | di
         scope = str(c["operating_scope"]).strip()
         lines.append(f"\n**经营范围**：{scope[:400]}{'…' if len(scope) > 400 else ''}")
 
-    ind = {} if isinstance(ind_raw, BaseException) else (ind_raw.get("data") or {})
-    inds = ind.get("industry") or []
     cons = ind.get("concept") or []
-    if inds:
-        lines.append("\n**所属行业**：" + "、".join(i.get("ind_name", "") for i in inds))
+    if industries:
+        lines.append("\n**所属行业**：" + "、".join(
+            f"{i.get('ind_name', '')}（K 线代码 {i['kline_symbol']}）" if i["kline_symbol"] else i.get("ind_name", "")
+            for i in industries))
     if cons:
         lines.append("**概念板块**：" + "、".join(i.get("ind_name", "") for i in cons[:25]))
     return "\n".join(lines)

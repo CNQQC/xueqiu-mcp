@@ -388,7 +388,8 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await server.search_posts("红利", user_id="123")).content[0].text, "ok")
             search.assert_awaited_once_with("红利", 10, 1, "123", since_id=None, since=None, until=None,
                                            original_only=False, min_followers=None, format="markdown",
-                                           exact_phrase=False, deduplicate=True, exclude_content_hashes=None)
+                                           exact_phrase=False, deduplicate=True, exclude_content_hashes=None,
+                                           cursor="", enrich_symbols=False)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -12,8 +12,18 @@ from .results import iso_time
 from .symbols import market_of
 
 
-def market_zone(symbol):
-    return ZoneInfo({"CN": "Asia/Shanghai", "HK": "Asia/Hong_Kong", "US": "America/New_York"}[market_of(symbol)])
+def market_zone(symbol, market=None):
+    market = market or {}
+    if market.get("time_zone"):
+        try:
+            return ZoneInfo(market["time_zone"])
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    zones = {"CN": "Asia/Shanghai", "HK": "Asia/Hong_Kong", "US": "America/New_York"}
+    name = zones.get(market.get("region")) or zones.get(market_of(symbol))
+    if name is None:
+        raise XueqiuError(f"无法确认 {symbol} 的交易所时区，请稍后重试。")
+    return ZoneInfo(name)
 
 
 def period_end(day: date, period: str) -> date:
@@ -26,13 +36,14 @@ def period_end(day: date, period: str) -> date:
 
 
 def observation(symbol, quote_data):
-    zone = market_zone(symbol)
-    observed = datetime.now(zone)
     rows = (quote_data.get("data") or {}).get("items") or []
     snapshot = next((r for r in rows if (r.get("quote") or {}).get("symbol") == symbol), {})
     quote = snapshot.get("quote") or {}
+    market = snapshot.get("market") or {}
+    zone = market_zone(symbol, market)
+    observed = datetime.now(zone)
     return {"as_of": observed.isoformat(), "quote_as_of": iso_time(quote.get("timestamp"), zone),
-            "market_status": (snapshot.get("market") or {}).get("status"),
+            "market_status": market.get("status"),
             "currency": quote.get("currency")}, observed, zone
 
 
