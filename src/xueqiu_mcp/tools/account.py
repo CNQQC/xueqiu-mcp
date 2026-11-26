@@ -38,15 +38,19 @@ def _render_user(user: dict) -> str:
     return "\n".join(lines)
 
 
-async def login_status() -> str:
+async def login_status(format: str = "markdown") -> str | dict:
     client = get_client()
     if not client.has_user_cookie:
         attempt = login_flow.get_flow().attempt
         if attempt and attempt.state == "pending" and not attempt.done.is_set():
             state = login_flow.get_flow().lookup(attempt.token)
             if state["state"] == "pending":
+                if format == "json":
+                    return {"state": "pending"}
                 link = f"\n[打开雪球登录页]({attempt.login_url})" if attempt.login_url else ""
                 return f"正在等待登录。{attempt.message}{link}\n扫码后凭证会自动接管，无需再次取码。"
+        if format == "json":
+            return {"state": "anonymous"}
         return (
             "当前为**匿名模式**。\n"
             "行情、K 线、财务、选股器等公开数据都能正常使用；"
@@ -62,7 +66,11 @@ async def login_status() -> str:
     try:
         user = await auth.fetch_profile(client)
     except auth.LoginError as exc:
+        if format == "json":
+            return {"state": "invalid", "reason": str(exc)}
         return f"{head}\n\n登录态**已失效**：{exc}\n\n请重新登录。\n\n" + LOGIN_HELP
+    if format == "json":
+        return {"state": "authenticated", "user": {k: user.get(k) for k in ("id", "screen_name", "followers_count", "friends_count", "status_count")}}
     return f"已登录 ✅\n{head}\n\n{_render_user(user)}"
 
 

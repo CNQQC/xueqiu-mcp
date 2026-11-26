@@ -53,6 +53,9 @@ jobs:
       - name: 接口重试与用户搜索测试
         run: python tests/test_client_social.py
 
+      - name: 结构化结果与分页契约
+        run: python tests/test_structured.py
+
       - name: 部署入口测试
         run: python tests/test_deploy.py
 

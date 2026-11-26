@@ -20,6 +20,7 @@ except ImportError:  # mcp 1.x
 
 from . import browser, login_flow
 from .client import get_client
+from .results import OutputFormat, tool_result
 from .tools import account, capital, f10, finance, quote, social
 from .tools import market as market_tools
 
@@ -38,6 +39,7 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 数据均为雪球公开数据，行情可能有延迟，不构成投资建议。
 
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
+只读工具使用 format=json 返回原始数值和 ISO 时间。翻页请沿 pagination.next_page 续读，评论传 comment_page。
 
 查某个人的一手观点时，先 search_users 找到并核对账号，再 search_posts(query=主题词,
 user_id=该账号ID)。不要仅把人名拼进全站搜索的 query，否则会搜到别人讨论他或转载他的帖子。
@@ -83,7 +85,7 @@ mcp.custom_route("/login/{token}/state", methods=["GET"])(login_flow.login_state
 
 # ------------------------------------------------------------------ 搜索与行情
 @mcp.tool()
-async def search_stock(query: str, limit: int = 10) -> str:
+async def search_stock(query: str, limit: int = 10, format: OutputFormat = "markdown") -> CallToolResult:
     """按名称、拼音或代码搜索股票，返回雪球标准代码。
 
     当用户给的是公司名称而不是代码，且需要确认具体标的时使用。
@@ -92,11 +94,12 @@ async def search_stock(query: str, limit: int = 10) -> str:
         query: 名称 / 拼音首字母 / 代码，如「茅台」「gzmt」「600519」
         limit: 返回条数，最多 20
     """
-    return await quote.search_stock(query, limit)
+    value = await quote.search_stock(query, limit, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_quote(symbols: str, detail: bool = False) -> str:
+async def get_quote(symbols: str, detail: bool = False, format: OutputFormat = "markdown") -> CallToolResult:
     """实时行情快照：价格、涨跌、成交、市值、PE/PB、股息率等。
 
     支持一次查多个标的，用逗号分隔，也支持 A 股 / 港股 / 美股 / 指数 / ETF / 可转债。
@@ -105,7 +108,8 @@ async def get_quote(symbols: str, detail: bool = False) -> str:
         symbols: 一个或多个代码，如 "600519" 或 "600519,00700,AAPL"
         detail: 为 true 时返回全部行情字段（含质押比例、商誉占比等）
     """
-    return await quote.get_quote(symbols, detail)
+    value = await quote.get_quote(symbols, detail, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
@@ -115,28 +119,35 @@ async def get_kline(
     count: int = 60,
     adjust: str = "before",
     with_valuation: bool = False,
-) -> str:
+    exclude_today: bool = False, format: OutputFormat = "markdown",
+) -> CallToolResult:
     """历史 K 线，可选带上每根 K 线的 PE / PB / PS / 市值。
 
     Args:
         symbol: 股票代码
         period: 周期，1m/5m/15m/30m/60m/120m/day/week/month/quarter/year
         count: 最近多少根 K 线，最多 500
+        exclude_today: 排除交易所当天及覆盖当天的未结束周期
         adjust: 复权方式，before 前复权 / after 后复权 / normal 不复权
         with_valuation: 为 true 时附带估值指标，适合做估值分位分析
     """
-    return await quote.get_kline(symbol, period, count, adjust, with_valuation)
+    value = await quote.get_kline(
+        symbol, period, count, adjust, with_valuation,
+        exclude_today=exclude_today, format=format,
+    )
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_minute(symbol: str, period: str = "1d") -> str:
+async def get_minute(symbol: str, period: str = "1d", format: OutputFormat = "markdown") -> CallToolResult:
     """当日或近 5 日分时走势（自动抽样到约 40 个点）。
 
     Args:
         symbol: 股票代码
         period: 1d 当日 / 5d 近五日
     """
-    return await quote.get_minute(symbol, period)
+    value = await quote.get_minute(symbol, period, format=format)
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 财务
@@ -147,7 +158,8 @@ async def get_financial_statement(
     report_type: str = "all",
     count: int = 5,
     detail: bool = False,
-) -> str:
+    format: OutputFormat = "markdown",
+) -> CallToolResult:
     """财务报表与核心指标，按「指标 × 报告期」排版便于跨期对比。
 
     A 股 / 港股 / 美股都支持，字段已翻译成中文并换算单位。
@@ -159,85 +171,97 @@ async def get_financial_statement(
         count: 取最近几期，最多 20
         detail: 为 true 时输出全部科目，否则只给核心科目
     """
-    return await finance.get_financial_statement(symbol, statement, report_type, count, detail)
+    value = await finance.get_financial_statement(symbol, statement, report_type, count, detail, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_business_breakdown(symbol: str, count: int = 2) -> str:
+async def get_business_breakdown(symbol: str, count: int = 2, format: OutputFormat = "markdown") -> CallToolResult:
     """主营构成：按产品和地区拆分的收入、成本与毛利率（仅 A 股）。
 
     Args:
         symbol: 股票代码
         count: 取最近几个报告期，最多 8
     """
-    return await finance.get_business_breakdown(symbol, count)
+    value = await finance.get_business_breakdown(symbol, count, format=format)
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 公司资料
 @mcp.tool()
-async def get_company_profile(symbol: str) -> str:
+async def get_company_profile(symbol: str, format: OutputFormat = "markdown") -> CallToolResult:
     """公司资料：简介、主营、实控人、员工数、所属行业与概念板块（仅 A 股）。
 
     Args:
         symbol: 股票代码
     """
-    return await f10.get_company_profile(symbol)
+    value = await f10.get_company_profile(symbol, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_shareholders(symbol: str, top_n: int = 10) -> str:
+async def get_shareholders(symbol: str, top_n: int = 10, format: OutputFormat = "markdown") -> CallToolResult:
     """股东结构：股东户数走势、十大流通股东、基金/社保/QFII 等机构持仓（仅 A 股）。
 
     Args:
         symbol: 股票代码
         top_n: 展示前几大流通股东，最多 20
     """
-    return await f10.get_shareholders(symbol, top_n)
+    value = await f10.get_shareholders(symbol, top_n, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_dividends(symbol: str, count: int = 10) -> str:
+async def get_dividends(symbol: str, count: int = 10, format: OutputFormat = "markdown") -> CallToolResult:
     """历年分红送配方案与除权除息日（仅 A 股）。
 
     Args:
         symbol: 股票代码
         count: 取最近几次，最多 50
     """
-    return await f10.get_dividends(symbol, count)
+    value = await f10.get_dividends(symbol, count, format=format)
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 资金
 @mcp.tool()
-async def get_capital_flow(symbol: str, days: int = 10) -> str:
+async def get_capital_flow(
+    symbol: str, days: int = 10,
+    exclude_today: bool = False, format: OutputFormat = "markdown",
+) -> CallToolResult:
     """主力资金流向：每日净流入走势，以及当日大中小单的成交结构。
 
     Args:
         symbol: 股票代码
         days: 回溯天数，接口最多提供约 20 个交易日
+        exclude_today: 排除交易所当天后重新计算累计净额
     """
-    return await capital.get_capital_flow(symbol, days)
+    value = await capital.get_capital_flow(symbol, days, exclude_today=exclude_today, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_margin_trading(symbol: str, days: int = 10) -> str:
+async def get_margin_trading(symbol: str, days: int = 10, format: OutputFormat = "markdown") -> CallToolResult:
     """融资融券余额、融资买入与净买入（仅两融标的）。
 
     Args:
         symbol: 股票代码
         days: 回溯交易日数，最多 90
     """
-    return await capital.get_margin_trading(symbol, days)
+    value = await capital.get_margin_trading(symbol, days, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_block_trades(symbol: str, count: int = 10) -> str:
+async def get_block_trades(symbol: str, count: int = 10, format: OutputFormat = "markdown") -> CallToolResult:
     """大宗交易明细：成交价、折溢价率与买卖双方营业部。
 
     Args:
         symbol: 股票代码
         count: 取最近几笔，最多 50
     """
-    return await capital.get_block_trades(symbol, count)
+    value = await capital.get_block_trades(symbol, count, format=format)
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 市场
@@ -252,7 +276,8 @@ async def screen_stocks(
     industry: str | None = None,
     exchange: str | None = None,
     columns: str | None = None,
-) -> str:
+    format: OutputFormat = "markdown",
+) -> CallToolResult:
     """选股器：按估值、财务、行情等指标筛选并排序股票。
 
     filters 写成 `指标:下限~上限`，多条用逗号分隔，边界可留空。
@@ -271,13 +296,18 @@ async def screen_stocks(
         exchange: A 股范围，sh_sz 沪深 / sh / sz / bj
         columns: 额外展示的指标，逗号分隔；注意会排除该指标为空的标的
     """
-    return await market_tools.screen_stocks(
-        market, order_by, order, limit, page, filters, industry, exchange, columns
+    value = await market_tools.screen_stocks(
+        market, order_by, order, limit, page, filters, industry, exchange, columns,
+        format=format,
     )
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def list_screener_metrics(market: str = "CN", keyword: str | None = None) -> str:
+async def list_screener_metrics(
+    market: str = "CN", keyword: str | None = None,
+    format: OutputFormat = "markdown",
+) -> CallToolResult:
     """列出选股器支持的全部指标及其中文名（雪球官方元数据）。
 
     在使用 screen_stocks 前调用，以确认指标名的正确写法。
@@ -287,35 +317,39 @@ async def list_screener_metrics(market: str = "CN", keyword: str | None = None) 
         market: CN / HK / US
         keyword: 按中文名或指标名过滤，如「市盈」「roe」。省略则返回全部指标
     """
-    return await market_tools.list_screener_metrics(market, keyword)
+    value = await market_tools.list_screener_metrics(market, keyword, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def list_industries(market: str = "CN") -> str:
+async def list_industries(market: str = "CN", format: OutputFormat = "markdown") -> CallToolResult:
     """申万行业分类列表，返回的 encode 可作为 screen_stocks 的 industry 参数。
 
     Args:
         market: CN / HK / US
     """
-    return await market_tools.list_industries(market)
+    value = await market_tools.list_industries(market, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_hot_stocks(market: str = "CN", limit: int = 20) -> str:
+async def get_hot_stocks(market: str = "CN", limit: int = 20, format: OutputFormat = "markdown") -> CallToolResult:
     """雪球人气榜：按用户关注热度排序的股票及热度变化。
 
     Args:
         market: CN A股 / HK 港股 / US 美股
         limit: 取前多少名，最多 100
     """
-    return await market_tools.get_hot_stocks(market, limit)
+    value = await market_tools.get_hot_stocks(market, limit, format=format)
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 社区（论坛）
 @mcp.tool()
 async def get_stock_discussions(
-    symbol: str, sort: str = "hot", count: int = 10, page: int = 1
-) -> str:
+    symbol: str, sort: str = "hot", count: int = 10, page: int = 1,
+    format: OutputFormat = "markdown",
+) -> CallToolResult:
     """个股讨论区帖子：作者、粉丝数、点赞评论数与正文。
 
     想了解市场情绪、散户与大 V 观点时使用。
@@ -326,11 +360,15 @@ async def get_stock_discussions(
         count: 每页最多 30 条，超过 20 条自动分批获取，结果显示请求数和实返数
         page: 页码
     """
-    return await social.get_stock_discussions(symbol, sort, count, page)
+    value = await social.get_stock_discussions(symbol, sort, count, page, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_stock_news(symbol: str, kind: str = "news", count: int = 10, page: int = 1) -> str:
+async def get_stock_news(
+    symbol: str, kind: str = "news", count: int = 10, page: int = 1,
+    format: OutputFormat = "markdown",
+) -> CallToolResult:
     """个股新闻或公告流。
 
     Args:
@@ -339,21 +377,23 @@ async def get_stock_news(symbol: str, kind: str = "news", count: int = 10, page:
         count: 条数，最多 30
         page: 页码
     """
-    return await social.get_stock_news(symbol, kind, count, page)
+    value = await social.get_stock_news(symbol, kind, count, page, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_hot_posts(count: int = 10) -> str:
-    """雪球首页热门讨论，用于了解当前全市场关注的话题。
+async def get_hot_posts(count: int = 10, page: int = 1, format: OutputFormat = "markdown") -> CallToolResult:
+    """雪球首页热门讨论。首页 page=1，续读传入上次返回的 next_page 游标。
 
     Args:
         count: 条数，最多 30
     """
-    return await social.get_hot_posts(count)
+    value = await social.get_hot_posts(count, page=page, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def search_users(query: str, count: int = 10, page: int = 1) -> str:
+async def search_users(query: str, count: int = 10, page: int = 1, format: OutputFormat = "markdown") -> CallToolResult:
     """按昵称或关键词搜索雪球用户，返回用户 ID、昵称、主页及可用的认证和简介。
 
     不知道作者 ID 时先调用本工具；支持昵称片段，例如「老木匠」可找到「买股票的老木匠」。
@@ -365,14 +405,20 @@ async def search_users(query: str, count: int = 10, page: int = 1) -> str:
         count: 条数，最多 30
         page: 页码
     """
-    return await social.search_users(query, count, page)
+    value = await social.search_users(query, count, page, format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()
 async def search_posts(
-    query: str, count: int = 10, page: int = 1, user_id: str | None = None
-) -> str:
+    query: str, count: int = 10, page: int | str = 1, user_id: str | None = None,
+    since_id: str | int | None = None, since: str | None = None, until: str | None = None,
+    original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
+) -> CallToolResult:
     """搜索雪球帖子及关键词附近原文摘录，可限定作者并校验作者 ID。
+
+    since_id 排除边界 ID；since/until 按发布时间筛选，纯日期包含当日。original_only 排除转发和纯 @ 提及。
+    min_followers 过滤作者粉丝数。页内游标从 pagination.next_page 获取。
 
     查某人一手观点必须先 search_users 确认账号，再传 user_id；只在 query 里写人名会
     搜到他人的转述。结果区分作者文字和引用/转发；引用观点前用 get_post 获取全文。
@@ -383,13 +429,18 @@ async def search_posts(
         page: 页码
         user_id: 雪球用户数字 ID 或主页/帖子链接，可先用 search_users 查找；不填则全站搜索
     """
-    return await social.search_posts(query, count, page, user_id)
+    value = await social.search_posts(
+        query, count, page, user_id,
+        since_id=since_id, since=since, until=until, original_only=original_only, min_followers=min_followers, format=format,
+    )
+    return tool_result(value, format)
 
 
 @mcp.tool()
 async def get_post(
-    post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True
-) -> str:
+    post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True,
+    comment_page: int = 1, format: OutputFormat = "markdown",
+) -> CallToolResult:
     """按帖子 ID 取全文及热门评论。ID 可从讨论列表或热帖列表中获得。
 
     返回发布时间和编辑状态。雪球提供编辑时间时显示“已编辑”和北京时间，否则显示“未知”。
@@ -399,32 +450,49 @@ async def get_post(
     Args:
         post_id: 帖子数字 ID，或完整帖子链接
         with_comments: 是否附带评论
-        comment_count: 评论条数，最多 30
+        comment_count: 每页评论条数，最多 30
+        comment_page: 评论页码，从 1 起，按 pagination.next_page 继续
         full_text: 正文被截断时是否用本地浏览器补全；设 false 可省掉这次开销
     """
-    return await social.get_post(post_id, with_comments, comment_count, full_text)
+    value = await social.get_post(
+        post_id, with_comments, comment_count, full_text,
+        comment_page=comment_page, format=format,
+    )
+    return tool_result(value, format)
 
 
 @mcp.tool()
-async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
+async def get_user_posts(
+    user_id: str, count: int = 10, page: int | str = 1,
+    since_id: str | int | None = None, since: str | None = None, until: str | None = None,
+    original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
+) -> CallToolResult:
     """查看某位雪球用户的发帖动态，用于跟踪特定作者的观点。
+
+    since_id 排除边界 ID；since/until 按发布时间筛选，纯日期包含当日。original_only 排除转发和纯 @ 提及。
+    min_followers 过滤作者粉丝数。续读请传回 pagination.next_page。
 
     Args:
         user_id: 雪球用户数字 ID 或主页/帖子链接（xueqiu.com/<user_id>/<post_id>）
         count: 每页最多 30 条，超过 20 条自动分批获取，结果显示请求数和实返数
         page: 页码
     """
-    return await social.get_user_posts(user_id, count, page)
+    value = await social.get_user_posts(
+        user_id, count, page,
+        since_id=since_id, since=since, until=until, original_only=original_only, min_followers=min_followers, format=format,
+    )
+    return tool_result(value, format)
 
 
 # ------------------------------------------------------------------ 账号
 @mcp.tool()
-async def login_status() -> str:
+async def login_status(format: OutputFormat = "markdown") -> CallToolResult:
     """查看当前是匿名还是已登录，以及登录的是哪个雪球账号。
 
     某个接口报「被风控拦截」或「需要登录」时，先用它确认登录态。
     """
-    return await account.login_status()
+    value = await account.login_status(format=format)
+    return tool_result(value, format)
 
 
 @mcp.tool()

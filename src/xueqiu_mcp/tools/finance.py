@@ -7,6 +7,7 @@ from ..fields import STATEMENTS
 from ..fields_intl import HK_STATEMENTS, US_STATEMENTS
 from ..formatting import fmt_metric, fmt_money, fmt_rate, fmt_ts, md_table
 from ..resolve import resolve_symbol
+from ..results import field_unit, iso_time, records
 from ..symbols import market_of
 
 REPORT_TYPES = {
@@ -23,7 +24,8 @@ async def get_financial_statement(
     report_type: str = "all",
     count: int = 5,
     detail: bool = False,
-) -> str:
+    format: str = "markdown",
+) -> str | dict:
     """拉取财务报表，按「指标 × 报告期」转置成表格便于跨期对比。"""
     if statement not in STATEMENTS:
         return f"statement 仅支持：{', '.join(STATEMENTS)}"
@@ -42,6 +44,13 @@ async def get_financial_statement(
     )
     d = data.get("data") or {}
     rows = d.get("list") or []
+    if format == "json":
+        keys = list(mapping) if detail else brief
+        items = [{"report_name": r.get("report_name"), "report_date": iso_time(r.get("report_date")),
+                  "metrics": {k: r[k] for k in keys if k in r}} for r in rows]
+        return records(items, count, 20, symbol=sym, statement=statement, currency=d.get("currency"),
+                       units={k: field_unit(mapping[k][1], d.get("currency")) for k in keys},
+                       metric_columns=["value", "yoy_fraction"])
     if not rows:
         return f"{sym} 未取到{title}数据（该市场或该报告类型可能无数据）。"
 
@@ -82,7 +91,7 @@ def _has_value(cell) -> bool:
 _BIZ_CLASS = {1: "按行业", 2: "按产品", 3: "按地区", 4: "按业务", 5: "按销售模式"}
 
 
-async def get_business_breakdown(symbol: str, count: int = 2) -> str:
+async def get_business_breakdown(symbol: str, count: int = 2, format: str = "markdown") -> str | dict:
     """主营构成：按产品 / 地区 / 销售模式拆分的收入占比与毛利率。"""
     sym = await resolve_symbol(symbol)
     data = await get_client().get(
@@ -91,6 +100,14 @@ async def get_business_breakdown(symbol: str, count: int = 2) -> str:
     )
     d = data.get("data") or {}
     periods = d.get("list") or []
+    if format == "json":
+        items = [{"report_date": iso_time(p.get("report_date")), "report_name": p.get("report_name"),
+                  "groups": [{"class_standard": g.get("class_standard"),
+                              "items": [{k: it.get(k) for k in ("project_announced_name", "prime_operating_income",
+                                         "income_ratio", "gross_profit_rate")} for it in g.get("business_list") or []]}
+                             for g in p.get("class_list") or []]} for p in periods]
+        return records(items, count, 8, symbol=sym, units={"prime_operating_income": d.get("currency"),
+                       "income_ratio": "fraction", "gross_profit_rate": "fraction"})
     if not periods:
         return f"{sym} 无主营构成数据（该接口仅覆盖 A 股）。"
 

@@ -6,7 +6,12 @@ import time
 from typing import Any
 
 from ..cache import ttl_for
+import asyncio
+
 from ..client import get_client
+from ..results import field_unit, iso_time, records, select_fields
+from ..trading import market_zone, partial_bar, period_end, read_observation
+from datetime import datetime, time as wall_time
 from ..fields import QUOTE_BRIEF, QUOTE_FIELDS
 from ..formatting import (
     fmt_money,
@@ -29,15 +34,17 @@ ADJUST_TYPES = {"before": "前复权", "after": "后复权", "normal": "不复�
 KLINE_PATH = "/v5/stock/chart/kline.json"
 
 
-async def search_stock(query: str, limit: int = 10) -> str:
-    hits = await search(query, size=limit)
+async def search_stock(query: str, limit: int = 10, format: str = "markdown") -> str | dict:
+    hits = await search(query, size=max(1, min(limit, 20)))
+    if format == "json":
+        return records(hits, limit, 20, query=query)
     if not hits:
         return f"未搜索到与「{query}」相关的标的。"
     rows = [[h["symbol"], h["name"], h["type"]] for h in hits]
     return f"「{query}」搜索结果：\n\n" + md_table(["代码", "名称", "类型"], rows)
 
 
-async def get_quote(symbols: str, detail: bool = False) -> str:
+async def get_quote(symbols: str, detail: bool = False, format: str = "markdown") -> str | dict:
     """实时行情。支持一次传多个标的，逗号分隔。"""
     syms = await resolve_many(symbols)
     if not syms:
@@ -47,6 +54,16 @@ async def get_quote(symbols: str, detail: bool = False) -> str:
         "/v5/stock/batch/quote.json", {"symbol": ",".join(syms), "extend": "detail"}
     )
     items = (data.get("data") or {}).get("items") or []
+    if format == "json":
+        quotes = []
+        for item in items:
+            q = item.get("quote") or {}
+            keys = list(QUOTE_FIELDS) if detail else QUOTE_BRIEF
+            values = select_fields(q, keys, dates={"issue_date"})
+            quotes.append({**values, "as_of": iso_time(q.get("timestamp")), "currency": q.get("currency"),
+                           "market_status": (item.get("market") or {}).get("status"),
+                           "units": {k: field_unit(QUOTE_FIELDS[k][1], q.get("currency")) for k in values}})
+        return records(quotes, len(syms), None)
     if not items:
         return f"未取到 {', '.join(syms)} 的行情数据，请确认代码是否正确。"
 
@@ -78,12 +95,14 @@ async def get_kline(
     count: int = 60,
     adjust: str = "before",
     with_valuation: bool = False,
-) -> str:
+    exclude_today: bool = False, format: str = "markdown",
+) -> str | dict:
     """历史 K 线。count 为最近 N 根，可选带上 PE/PB/市值。"""
     sym = await resolve_symbol(symbol)
     period = KLINE_PERIODS.get(period, period)
     if period not in KLINE_PERIODS:
         return f"不支持的周期「{period}」，可选：{', '.join(KLINE_PERIODS)}"
+    requested = count
     count = max(1, min(int(count), 500))
 
     indicator = "kline"
@@ -95,22 +114,30 @@ async def get_kline(
     step = max(1.0, ttl_for(KLINE_PATH))
     begin = int(time.time() // step * step * 1000)
 
-    data = await get_client().get(
+    zone = market_zone(sym)
+    today = datetime.now(zone).date()
+    if exclude_today:
+        begin = int(datetime.combine(today, wall_time.min, zone).timestamp() * 1000) - 1
+    client = get_client()
+    data, (snapshot, observed, zone) = await asyncio.gather(client.get(
         KLINE_PATH,
         {
             "symbol": sym,
             "begin": begin,
             "period": period,
             "type": adjust,
-            "count": -count,
+            "count": -min(500, count + int(exclude_today)),
             "indicator": indicator,
         },
-    )
+    ), read_observation(client, sym))
     d = data.get("data") or {}
     cols: list[str] = d.get("column") or []
     items: list[list] = d.get("item") or []
-    if not items:
-        return f"{sym} 无 K 线数据。"
+    if exclude_today and "timestamp" in cols:
+        ts_index = cols.index("timestamp")
+        items = [row for row in items if (stamp := iso_time(row[ts_index], zone))
+                 and period_end(datetime.fromisoformat(stamp).date(), period) < today]
+    items = items[-count:]
 
     idx = {c: i for i, c in enumerate(cols)}
     show = ["timestamp", "open", "high", "low", "close", "percent", "volume", "amount", "turnoverrate"]
@@ -123,6 +150,18 @@ async def get_kline(
         "pe": "PE", "pb": "PB", "ps": "PS", "market_capital": "总市值",
     }
 
+    last_stamp = iso_time(items[-1][idx["timestamp"]], zone) if items else None
+    partial = partial_bar(last_stamp, period, observed, snapshot)
+    if format == "json":
+        bars = [{**{c: row[idx[c]] for c in show}, "timestamp": iso_time(row[idx["timestamp"]], zone),
+                 "is_partial": partial if i == len(items) - 1 else False} for i, row in enumerate(items)]
+        money = snapshot["currency"]
+        units = {c: ("percent" if c in ("percent", "turnoverrate") else "shares" if c == "volume" else
+                     "multiple" if c in ("pe", "pb", "ps") else money) for c in show if c != "timestamp"}
+        return records(bars, requested, 500, symbol=sym, period=period, adjust=adjust, exclude_today=exclude_today,
+                       units=units, is_partial=partial, **snapshot)
+    if not items:
+        return f"{sym} 无符合条件的 K 线数据。"
     tf = "%Y-%m-%d" if period in ("day", "week", "month", "quarter", "year") else "%m-%d %H:%M"
     rows = []
     for row in items:
@@ -150,10 +189,12 @@ async def get_kline(
         f"区间：{rows[0][0]} ~ {rows[-1][0]}　收盘 {fmt_num(first, 3)} → {fmt_num(last, 3)}"
         f"　区间涨跌 {fmt_pct(chg, signed=True)}\n"
     )
+    state = {True: "盘中未完成", False: "已完成", None: "完成状态未知"}[partial]
+    title += f"最后一根：{state}　as_of={snapshot['as_of']}　exclude_today={exclude_today}\n"
     return title + "\n" + md_table([labels[c] for c in show], rows)
 
 
-async def get_minute(symbol: str, period: str = "1d") -> str:
+async def get_minute(symbol: str, period: str = "1d", format: str = "markdown") -> str | dict:
     """分时走势。period: 1d 当日 / 5d 五日。"""
     sym = await resolve_symbol(symbol)
     if period not in ("1d", "5d"):
@@ -164,6 +205,13 @@ async def get_minute(symbol: str, period: str = "1d") -> str:
     )
     d = data.get("data") or {}
     items = (d.get("items") or []) + (d.get("after") or [])
+    if format == "json":
+        from ..symbols import market_of
+        currency = d.get("currency") or {"CN": "CNY", "HK": "HKD", "US": "USD"}[market_of(sym)]
+        keys = ("timestamp", "current", "avg_price", "percent", "volume", "amount")
+        return records([select_fields(i, keys, dates={"timestamp"}) for i in items], symbol=sym, period=period,
+                       last_close=d.get("last_close"), units={"current": currency, "avg_price": currency,
+                       "volume": "shares", "percent": "percent", "amount": currency})
     if not items:
         return f"{sym} 暂无分时数据（可能未开盘或代码有误）。"
 
