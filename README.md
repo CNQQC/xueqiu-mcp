@@ -174,6 +174,23 @@ get_post(post_id="上一步返回的帖子ID", with_comments=false)
 
 `get_user_posts` 和 `get_stock_discussions` 每页最多请求 30 条，超过 20 条时自动分批读取。两者都显示请求数和实返数。用户动态接口的 `10022` 也会出现在特定分页请求中，仅凭该错误无法确认账号登录状态。
 
+### 导出 JSON、分页与增量采集
+
+所有 24 个只读工具都接受 `format="json"`。MCP 客户端可直接读取 `structuredContent`，只支持文本的客户端可对 `content[0].text` 调用 `JSON.parse`。默认返回 Markdown。JSON 中帖子和作者 ID 是字符串，计数是整数，缺失值为 `null`，时间使用带时区的 ISO 8601。金融数据的 `units` 单独给出金额币种、百分数或小数比率。
+
+```text
+search_posts(query="茅台", count=30, since="2026-01-01", until="2026-11-26", original_only=true, min_followers=100, format="json")
+get_user_posts(user_id="1422017996", since_id="400000000", count=30, format="json")
+get_post(post_id="392261408", comment_count=30, comment_page=2, format="json")
+get_kline(symbol="SH600519", period="day", count=20, exclude_today=true, format="json")
+get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
+```
+
+- 帖子列表及评论的 `pagination` 给出 `requested`、`returned`、单次上限 `max`、`has_more`、`next_page`。`has_more=null` 表示覆盖范围未知。续读时保持相同筛选和条数，将 `next_page` 原样传给 `page`，评论传给 `comment_page`。读取失败请查看 `note` 和可用的 `retry_page`。帖子头部的评论数可能包含楼中楼，分页针对评论接口实际可见的记录。
+- 热帖的 `next_page` 是上游游标。筛选后的搜帖和用户动态每次最多检查 8 个上游页，游标记录页内位置，`scanned` 为本次检查的条数。上游提供时，`upstream_max_page` 给出上游声明的页数。实时排序可能变化，跨调用落库时按帖子 ID 去重。
+- `since_id` 为排他下界。`since` 包含起点，`until` 若为时间则不含终点，若为日期则包含当日。无时区输入按北京时间解释。`original_only` 排除带转发标记、内联转述或正文仅有 @ 提及的记录。`min_followers` 指作者粉丝数，粉丝数缺失时无法通过该条件。
+- K 线、资金流的 `as_of` 是工具观测时间，`quote_as_of` 是行情快照时间。`is_partial=null` 表示现有市场状态不足以确认。`exclude_today=true` 按交易所当地日期排除当天，周、月、季、年 K 线同时排除覆盖当天的周期。资金累计按日期筛选后重新求和，不足完整窗口时金额为 `null`。
+
 ## 工具一览
 
 共 **29 个工具**。不同市场和标的的可用字段取决于雪球上游接口，部分功能仅适用于 A 股。

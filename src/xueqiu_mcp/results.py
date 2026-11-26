@@ -32,8 +32,8 @@ def iso_time(ms, zone: tzinfo = CN_TZ) -> str | None:
         return None
 
 
-def pagination(requested: int, returned: int, maximum: int, has_more: bool | None,
-               next_page: int | None, page: int, *, total: int | None = None) -> dict:
+def pagination(requested: int | None, returned: int, maximum: int | None, has_more: bool | None,
+               next_page: int | str | None, page: int | str, *, total: int | None = None) -> dict:
     return {"requested": requested, "returned": returned, "max": maximum, "page": page,
             "has_more": has_more, "next_page": next_page, "total": total}
 

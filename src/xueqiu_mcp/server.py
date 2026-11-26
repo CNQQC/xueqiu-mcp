@@ -39,6 +39,7 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 数据均为雪球公开数据，行情可能有延迟，不构成投资建议。
 
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
+只读工具使用 format=json 返回原始数值和 ISO 时间。翻页请沿 pagination.next_page 续读，评论传 comment_page。
 
 查某个人的一手观点时，先 search_users 找到并核对账号，再 search_posts(query=主题词,
 user_id=该账号ID)。不要仅把人名拼进全站搜索的 query，否则会搜到别人讨论他或转载他的帖子。
@@ -129,6 +130,7 @@ async def get_kline(
         symbol: 股票代码
         period: 周期，1m/5m/15m/30m/60m/120m/day/week/month/quarter/year
         count: 最近多少根 K 线，最多 500
+        exclude_today: 排除交易所当天及覆盖当天的未结束周期
         adjust: 复权方式，before 前复权 / after 后复权 / normal 不复权
         with_valuation: 为 true 时附带估值指标，适合做估值分位分析
     """
@@ -235,6 +237,7 @@ async def get_capital_flow(
     Args:
         symbol: 股票代码
         days: 回溯天数，接口最多提供约 20 个交易日
+        exclude_today: 排除交易所当天后重新计算累计净额
     """
     value = await capital.get_capital_flow(symbol, days, exclude_today=exclude_today, format=format)
     return tool_result(value, format)
@@ -383,7 +386,7 @@ async def get_stock_news(
 
 @mcp.tool()
 async def get_hot_posts(count: int = 10, page: int = 1, format: OutputFormat = "markdown") -> CallToolResult:
-    """雪球首页热门讨论，用于了解当前全市场关注的话题。
+    """雪球首页热门讨论。首页 page=1，续读传入上次返回的 next_page 游标。
 
     Args:
         count: 条数，最多 30
@@ -411,12 +414,15 @@ async def search_users(query: str, count: int = 10, page: int = 1, format: Outpu
 
 @mcp.tool()
 async def search_posts(
-    query: str, count: int = 10, page: int = 1, user_id: str | None = None,
-    since_id: str | None = None, since: str | None = None, until: str | None = None,
+    query: str, count: int = 10, page: int | str = 1, user_id: str | None = None,
+    since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
 ) -> CallToolResult:
     """搜索雪球帖子及关键词附近原文摘录，可限定作者并校验作者 ID。
+
+    since_id 排除边界 ID；since/until 按发布时间筛选，纯日期包含当日。original_only 排除转发和纯 @ 提及。
+    min_followers 过滤作者粉丝数。页内游标从 pagination.next_page 获取。
 
     查某人一手观点必须先 search_users 确认账号，再传 user_id；只在 query 里写人名会
     搜到他人的转述。结果区分作者文字和引用/转发；引用观点前用 get_post 获取全文。
@@ -451,7 +457,8 @@ async def get_post(
     Args:
         post_id: 帖子数字 ID，或完整帖子链接
         with_comments: 是否附带评论
-        comment_count: 评论条数，最多 30
+        comment_count: 每页评论条数，最多 30
+        comment_page: 评论页码，从 1 起，按 pagination.next_page 继续
         full_text: 正文被截断时是否用本地浏览器补全；设 false 可省掉这次开销
     """
     value = await social.get_post(
@@ -463,11 +470,14 @@ async def get_post(
 
 @mcp.tool()
 async def get_user_posts(
-    user_id: str, count: int = 10, page: int = 1,
-    since_id: str | None = None, since: str | None = None, until: str | None = None,
+    user_id: str, count: int = 10, page: int | str = 1,
+    since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
 ) -> CallToolResult:
     """查看某位雪球用户的发帖动态，用于跟踪特定作者的观点。
+
+    since_id 排除边界 ID；since/until 按发布时间筛选，纯日期包含当日。original_only 排除转发和纯 @ 提及。
+    min_followers 过滤作者粉丝数。续读请传回 pagination.next_page。
 
     Args:
         user_id: 雪球用户数字 ID 或主页/帖子链接（xueqiu.com/<user_id>/<post_id>）

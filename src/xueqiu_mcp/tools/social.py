@@ -382,15 +382,18 @@ async def _read_filtered(path, params, key, size, page, uid, filters):
     next_page = None
     last_source = None
     scanned = 0
+    retry_page = None
     for _ in range(8):
         try:
             rows, upstream, note = await _fetch_post_page(path, params, key, batch, source, REFERER, fixed_batch=batch)
         except (XueqiuError, httpx.RequestError) as exc:
             if not scanned:
                 raise
+            more, next_page, retry_page = None, None, f"p{source}r{offset}"
             notes.append(f"上游第 {source} 页读取失败。{exc}")
             break
         if upstream.get("retry_page"):
+            more, next_page, retry_page = None, None, f"p{source}r{offset}"
             notes.append(note)
             break
         last_source = upstream.get("upstream_max_page")
@@ -422,12 +425,14 @@ async def _read_filtered(path, params, key, size, page, uid, filters):
         notes.append(f"本次扫描 {scanned} 条候选，取得 {len(selected)} 条符合条件的帖子。")
     meta = pagination(size, len(selected), 30, more, next_page, page)
     meta.update(scanned=scanned, upstream_max_page=last_source)
+    if retry_page:
+        meta["retry_page"] = retry_page
     return selected, meta, " ".join(notes)
 
 
 async def search_posts(
-    query: str, count: int = 10, page: int = 1, user_id: str | None = None,
-    since_id: str | None = None, since: str | None = None, until: str | None = None,
+    query: str, count: int = 10, page: int | str = 1, user_id: str | None = None,
+    since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: str = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
 ) -> str | dict:
@@ -459,23 +464,19 @@ async def search_posts(
     if rejected:
         note += f" 已排除 {rejected} 条无法通过作者身份校验的结果。"
     note += " 以下为关键词附近摘录；引用前请用 get_post 获取全文并核对上下文。"
-    return _filtered_page(verified, meta, note, title, count, query, since_id, since, until,
-                          original_only, min_followers, format, exact_phrase=exact_phrase, deduplicate=deduplicate)
+    return _filtered_page(verified, meta, note, title, count, query, format,
+                          exact_phrase=exact_phrase, deduplicate=deduplicate)
 
 
-def _filtered_page(rows, meta, note, title, requested, query, since_id, since, until,
-                   original_only, min_followers, format, *, exact_phrase=False, deduplicate=False):
-    try:
-        posts = filter_posts(rows, since_id, since, until, original_only, min_followers)
-    except ValueError as exc:
-        return str(exc)
+def _filtered_page(posts, meta, note, title, requested, query, format, *, exact_phrase=False, deduplicate=False):
     if exact_phrase:
+        candidate_count = len(posts)
         phrase = search_text(query)
         posts = [p for p in posts if any(phrase in search_text(text) for text in (
             strip_html(p.get("title")), strip_html(p.get("text")) or strip_html(p.get("description"))
         ))]
-    if len(posts) < len(rows):
-        note += f" 本页有 {len(rows) - len(posts)} 条被筛选条件排除。"
+        if len(posts) < candidate_count:
+            note += f" 本页有 {candidate_count - len(posts)} 条未匹配完整短语。"
     if deduplicate:
         unique = []
         seen = set()
@@ -639,7 +640,7 @@ async def get_post(
 
 
 async def get_user_posts(
-    user_id: str, count: int = 10, page: int = 1, since_id: str | None = None,
+    user_id: str, count: int = 10, page: int | str = 1, since_id: str | int | None = None,
     since: str | None = None, until: str | None = None, original_only: bool = False,
     min_followers: int | None = None, format: str = "markdown",
 ) -> str | dict:
@@ -661,5 +662,4 @@ async def get_user_posts(
     if len(posts) < len(raw):
         note += f" 已排除 {len(raw) - len(posts)} 条作者不符或身份不明的动态。"
     name = _author(posts[0])[0] if posts else "雪球用户"
-    return _filtered_page(posts, meta, note, f"{name}（uid {uid}）的动态", count, "", since_id, since,
-                          until, original_only, min_followers, format)
+    return _filtered_page(posts, meta, note, f"{name}（uid {uid}）的动态", count, "", format)

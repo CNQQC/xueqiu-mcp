@@ -56,6 +56,9 @@ jobs:
       - name: 数据质量与凭证目录回退测试
         run: python tests/test_p1_data_quality.py
 
+      - name: 结构化结果与分页契约
+        run: python tests/test_structured.py
+
       - name: 部署入口测试
         run: python tests/test_deploy.py
 

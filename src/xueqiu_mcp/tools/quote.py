@@ -35,9 +35,9 @@ KLINE_PATH = "/v5/stock/chart/kline.json"
 
 
 async def search_stock(query: str, limit: int = 10, format: str = "markdown") -> str | dict:
-    hits = await search(query, size=limit)
+    hits = await search(query, size=max(1, min(limit, 20)))
     if format == "json":
-        return records(hits, limit, 50, query=query)
+        return records(hits, limit, 20, query=query)
     if not hits:
         return f"未搜索到与「{query}」相关的标的。"
     rows = [[h["symbol"], h["name"], h["type"]] for h in hits]
@@ -221,10 +221,12 @@ async def get_minute(symbol: str, period: str = "1d", format: str = "markdown") 
     d = data.get("data") or {}
     items = (d.get("items") or []) + (d.get("after") or [])
     if format == "json":
+        from ..symbols import market_of
+        currency = d.get("currency") or {"CN": "CNY", "HK": "HKD", "US": "USD"}[market_of(sym)]
         keys = ("timestamp", "current", "avg_price", "percent", "volume", "amount")
         return records([select_fields(i, keys, dates={"timestamp"}) for i in items], symbol=sym, period=period,
-                       last_close=d.get("last_close"), units={"current": "quote_currency", "avg_price": "quote_currency",
-                       "volume": "shares", "percent": "percent", "amount": "quote_currency"})
+                       last_close=d.get("last_close"), units={"current": currency, "avg_price": currency,
+                       "volume": "shares", "percent": "percent", "amount": currency})
     if not items:
         return f"{sym} 暂无分时数据（可能未开盘或代码有误）。"
 
