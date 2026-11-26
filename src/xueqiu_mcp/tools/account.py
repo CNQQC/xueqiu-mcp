@@ -12,7 +12,7 @@ import os
 
 from mcp.types import CallToolResult, ImageContent, TextContent
 
-from .. import auth, login_flow
+from .. import auth, browser, login_flow
 from ..client import get_client
 from ..formatting import fmt_count
 
@@ -38,19 +38,43 @@ def _render_user(user: dict) -> str:
     return "\n".join(lines)
 
 
-async def login_status() -> str:
+async def login_status(format: str = "markdown") -> str | dict:
+    readiness = await browser.browser_status()
+    login_help = LOGIN_HELP if readiness["available"] else (
+        "可以在服务主机运行 `xueqiu-mcp login --cookie` 登录。要启用扫码，请先处理上方的浏览器提示。"
+    )
+    state = await _login_state(format, login_help)
+    storage = auth.storage_status()
+    if format == "json":
+        return {**state, "browser": readiness, "credential_storage": storage}
+    location = storage["directory"] or "未知"
+    writable = "可写" if storage["writable"] else "不可写"
+    fallback = ""
+    if storage["location"] in ("home_fallback", "temporary"):
+        fallback = f"；首选目录 {storage['preferred_directory']} 无法写入"
+    if storage["location"] == "temporary":
+        fallback += "；临时文件可能被系统清理"
+    return (f"扫码浏览器：{'可用' if readiness['available'] else '不可用'}（{readiness['reason']}）\n"
+            f"凭证目录：{location}（{writable}{fallback}）\n\n{state}")
+
+
+async def _login_state(format: str, login_help: str) -> str | dict:
     client = get_client()
     if not client.has_user_cookie:
         attempt = login_flow.get_flow().attempt
         if attempt and attempt.state == "pending" and not attempt.done.is_set():
             state = login_flow.get_flow().lookup(attempt.token)
             if state["state"] == "pending":
+                if format == "json":
+                    return {"state": "pending"}
                 link = f"\n[打开雪球登录页]({attempt.login_url})" if attempt.login_url else ""
                 return f"正在等待登录。{attempt.message}{link}\n扫码后凭证会自动接管，无需再次取码。"
+        if format == "json":
+            return {"state": "anonymous"}
         return (
             "当前为**匿名模式**。\n"
             "行情、K 线、财务、选股器等公开数据都能正常使用；"
-            "受风控保护的社区接口和账号相关数据需要登录。\n\n" + LOGIN_HELP
+            "受风控保护的社区接口和账号相关数据需要登录。\n\n" + login_help
         )
 
     uid = auth.uid_from_cookies(client.user_cookies)
@@ -62,7 +86,11 @@ async def login_status() -> str:
     try:
         user = await auth.fetch_profile(client)
     except auth.LoginError as exc:
-        return f"{head}\n\n登录态**已失效**：{exc}\n\n请重新登录。\n\n" + LOGIN_HELP
+        if format == "json":
+            return {"state": "invalid", "reason": str(exc)}
+        return f"{head}\n\n登录态**已失效**：{exc}\n\n请重新登录。\n\n" + login_help
+    if format == "json":
+        return {"state": "authenticated", "user": {k: user.get(k) for k in ("id", "screen_name", "followers_count", "friends_count", "status_count")}}
     return f"已登录 ✅\n{head}\n\n{_render_user(user)}"
 
 
@@ -92,9 +120,12 @@ async def login_with_cookie(cookie: str, remember: bool = True) -> str:
 
     tail = ""
     if remember:
-        path = auth.save_cookies(jar, {"id": user.get("id"), "screen_name": user.get("screen_name")})
+        try:
+            path = auth.save_cookies(jar, {"id": user.get("id"), "screen_name": user.get("screen_name")})
+        except auth.LoginError as exc:
+            return f"登录成功，仅本次会话有效。{exc}"
         client.set_user_cookie(jar, f"凭证文件 {path}")
-        tail = f"\n\n凭证已保存到 `{path}`（权限 0600），重启后仍然有效。"
+        tail = f"\n\n凭证已保存到 `{path}`（权限 0600）。"
     else:
         tail = "\n\n未落盘，仅本次进程有效。"
     return f"登录成功 ✅\n\n{_render_user(user)}{tail}"
@@ -112,8 +143,6 @@ async def logout(forget: bool = True) -> str:
     if forget:
         parts.append(f"凭证文件已删除（{auth.store_path()}）。" if removed else "凭证文件本来就不存在。")
         # 浏览器 profile 是独立的第二份登录态，不一起清的话下次扫码会「自动登录」
-        from .. import browser
-
         if await browser.forget_profile():
             parts.append("本地浏览器的登录态也一并清除了。")
     else:

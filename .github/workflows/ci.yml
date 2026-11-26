@@ -53,6 +53,9 @@ jobs:
       - name: 接口重试与用户搜索测试
         run: python tests/test_client_social.py
 
+      - name: 数据质量与凭证目录回退测试
+        run: python tests/test_p1_data_quality.py
+
       - name: 部署入口测试
         run: python tests/test_deploy.py
 

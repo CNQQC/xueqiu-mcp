@@ -319,8 +319,8 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         schema = tool.model_dump(by_alias=True)["inputSchema"]
         self.assertIn("query", schema["required"])
         with patch.object(social, "search_users", new_callable=AsyncMock, return_value="ok") as search:
-            self.assertEqual(await server.search_users("财经", count=2, page=3), "ok")
-            search.assert_awaited_once_with("财经", 2, 3)
+            self.assertEqual((await server.search_users("财经", count=2, page=3)).content[0].text, "ok")
+            search.assert_awaited_once_with("财经", 2, 3, format="markdown")
 
     async def test_filtered_search_pagination_and_output(self):
         client = AsyncMock()
@@ -340,7 +340,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_small_pages_do_not_skip_remaining_matches(self):
         client = AsyncMock()
-        client.get.return_value = {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(1, 7)]}
+        client.get.return_value = {"list": [{"id": i, "user_id": 123, "text": f"茅台 {i}"} for i in range(1, 7)]}
         with patch.object(social, "get_client", return_value=client):
             result = await social.search_posts("茅台", user_id="123", count=3, page=2)
         self.assertEqual(client.get.call_args.args[1]["page"], 1)
@@ -350,8 +350,8 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_search_page_spans_upstream_boundaries(self):
         client = AsyncMock()
         client.get.side_effect = [
-            {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(1, 11)]},
-            {"list": [{"id": i, "user_id": 123, "text": "茅台"} for i in range(11, 21)]},
+            {"list": [{"id": i, "user_id": 123, "text": f"茅台 {i}"} for i in range(1, 11)]},
+            {"list": [{"id": i, "user_id": 123, "text": f"茅台 {i}"} for i in range(11, 21)]},
         ]
         with patch.object(social, "get_client", return_value=client):
             result = await social.search_posts("茅台", user_id="123", count=7, page=2)
@@ -383,8 +383,10 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("user_id", schema["properties"])
         self.assertNotIn("user_id", schema.get("required", []))
         with patch.object(social, "search_posts", new_callable=AsyncMock, return_value="ok") as search:
-            self.assertEqual(await server.search_posts("红利", user_id="123"), "ok")
-            search.assert_awaited_once_with("红利", 10, 1, "123")
+            self.assertEqual((await server.search_posts("红利", user_id="123")).content[0].text, "ok")
+            search.assert_awaited_once_with("红利", 10, 1, "123", since_id=None, since=None, until=None,
+                                           original_only=False, min_followers=None, format="markdown",
+                                           exact_phrase=False, deduplicate=True)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from ..fields import STATEMENTS
 from ..fields_intl import HK_STATEMENTS, US_STATEMENTS
 from ..formatting import fmt_metric, fmt_money, fmt_rate, fmt_ts, md_table
 from ..resolve import resolve_symbol
+from ..results import field_unit, iso_time, records
 from ..symbols import market_of
 
 REPORT_TYPES = {
@@ -15,6 +16,8 @@ REPORT_TYPES = {
 _MARKET_PATH = {"CN": "cn", "HK": "hk", "US": "us"}
 # 三个市场的财报字段名完全不同，各用各的映射表
 _MARKET_STATEMENTS = {"CN": STATEMENTS, "HK": HK_STATEMENTS, "US": US_STATEMENTS}
+HK_DPS_NOTE = ("雪球 dps 为报告期指标，单位为仙。部分中期数值与年度股息按月份折算的结果一致。"
+               "核实宣派金额、所属年度和支付日期，请以发行人的派息公告为准。")
 
 
 async def get_financial_statement(
@@ -23,7 +26,8 @@ async def get_financial_statement(
     report_type: str = "all",
     count: int = 5,
     detail: bool = False,
-) -> str:
+    format: str = "markdown",
+) -> str | dict:
     """拉取财务报表，按「指标 × 报告期」转置成表格便于跨期对比。"""
     if statement not in STATEMENTS:
         return f"statement 仅支持：{', '.join(STATEMENTS)}"
@@ -42,6 +46,15 @@ async def get_financial_statement(
     )
     d = data.get("data") or {}
     rows = d.get("list") or []
+    has_dps = region == "HK" and statement == "indicator" and any(_has_value(r.get("dps")) for r in rows)
+    if format == "json":
+        keys = list(mapping) if detail else brief
+        items = [{"report_name": r.get("report_name"), "report_date": iso_time(r.get("report_date")),
+                  "metrics": {k: r[k] for k in keys if k in r}} for r in rows]
+        return records(items, count, 20, symbol=sym, statement=statement, currency=d.get("currency"),
+                       units={k: field_unit(mapping[k][1], d.get("currency")) for k in keys},
+                       metric_columns=["value", "yoy_fraction"],
+                       **({"metric_notes": {"dps": HK_DPS_NOTE}} if has_dps else {}))
     if not rows:
         return f"{sym} 未取到{title}数据（该市场或该报告类型可能无数据）。"
 
@@ -66,6 +79,8 @@ async def get_financial_statement(
     )
     if d.get("tip"):
         head += f"提示：{d['tip']}\n"
+    if has_dps:
+        head += HK_DPS_NOTE + "\n"
     tail = "" if detail else f"\n\n（当前为精简视图，共 {len(mapping)} 个科目，传 detail=true 查看全部）"
     return head + "\n" + md_table(["指标"] + periods, table_rows) + tail
 
@@ -82,7 +97,7 @@ def _has_value(cell) -> bool:
 _BIZ_CLASS = {1: "按行业", 2: "按产品", 3: "按地区", 4: "按业务", 5: "按销售模式"}
 
 
-async def get_business_breakdown(symbol: str, count: int = 2) -> str:
+async def get_business_breakdown(symbol: str, count: int = 2, format: str = "markdown") -> str | dict:
     """主营构成：按产品 / 地区 / 销售模式拆分的收入占比与毛利率。"""
     sym = await resolve_symbol(symbol)
     data = await get_client().get(
@@ -91,6 +106,14 @@ async def get_business_breakdown(symbol: str, count: int = 2) -> str:
     )
     d = data.get("data") or {}
     periods = d.get("list") or []
+    if format == "json":
+        items = [{"report_date": iso_time(p.get("report_date")), "report_name": p.get("report_name"),
+                  "groups": [{"class_standard": g.get("class_standard"),
+                              "items": [{k: it.get(k) for k in ("project_announced_name", "prime_operating_income",
+                                         "income_ratio", "gross_profit_rate")} for it in g.get("business_list") or []]}
+                             for g in p.get("class_list") or []]} for p in periods]
+        return records(items, count, 8, symbol=sym, units={"prime_operating_income": d.get("currency"),
+                       "income_ratio": "fraction", "gross_profit_rate": "fraction"})
     if not periods:
         return f"{sym} 无主营构成数据（该接口仅覆盖 A 股）。"
 

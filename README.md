@@ -194,6 +194,8 @@ get_post(post_id="上一步返回的帖子ID", with_comments=false)
 | `get_financial_statement` | 利润表 / 资产负债表 / 现金流量表 / 主要指标，支持 A 股、港股、美股 |
 | `get_business_breakdown` | 主营构成：按产品与地区拆分收入、成本、毛利率（仅 A 股） |
 
+港股的每股股息指标 `dps` 保留雪球报告期原值，单位为仙。以腾讯为例，2026 年中报和三季报的数值分别为 265.0 和 397.5，恰与 2025 年度末期股息每股 530 仙的二分之一和四分之三吻合。腾讯公告第 33 页附注 7 载明，2026 年前九个月没有宣派中期股息。核实派息金额和日期应查发行人公告。[腾讯 2026 年第三季度业绩公告](https://www.tencent.com/wp-content/uploads/2026/11/C700_3Qresults.pdf)
+
 ### 公司资料
 
 | 工具 | 说明 |
@@ -206,7 +208,7 @@ get_post(post_id="上一步返回的帖子ID", with_comments=false)
 
 | 工具 | 说明 |
 | --- | --- |
-| `get_capital_flow` | 主力资金每日净流入 + 当日大中小单结构 |
+| `get_capital_flow` | 每日主力净流入，另列特大、大、中、小单的买入、卖出和净额。上游缺数保留为空 |
 | `get_margin_trading` | 融资融券余额与净买入 |
 | `get_block_trades` | 大宗交易明细（含买卖营业部） |
 
@@ -226,16 +228,16 @@ get_post(post_id="上一步返回的帖子ID", with_comments=false)
 | `get_stock_discussions` | 个股讨论区，可按热度或时间排序 |
 | `get_stock_news` | 个股新闻 / 公司公告流 |
 | `get_hot_posts` | 雪球首页热门讨论 |
-| `search_posts` | 按关键词搜索帖子，可用 `user_id` 限定作者 |
+| `search_posts` | 按关键词搜索帖子，可用 `user_id` 限定作者、`exact_phrase=true` 匹配连续短语。默认每页按内容去重 |
 | `search_users` | 按昵称或关键词搜索用户，返回用户 ID、主页、认证和简介 |
-| `get_post` | 帖子全文 + 热门评论 |
+| `get_post` | 帖子全文及最新评论，按时间倒序 |
 | `get_user_posts` | 某位用户的发帖动态 |
 
 ### 账号
 
 | 工具 | 说明 |
 | --- | --- |
-| `login_status` | 当前是匿名还是已登录，登录的是哪个账号 |
+| `login_status` | 当前登录状态、扫码浏览器可用性、凭证目录及写权限 |
 | `get_login_qrcode` | 立即返回登录二维码图片和临时网页链接，后台等待扫码（需装浏览器支持） |
 | `browser_login` | 默认同上；也可弹出浏览器窗口完成短信或滑块验证 |
 | `login_with_cookie` | 用浏览器 Cookie 登录，可选择是否保存到本地 |
@@ -278,7 +280,7 @@ pbpaste | .venv/bin/xueqiu-mcp login --cookie -
 .venv/bin/xueqiu-mcp logout
 ```
 
-凭证默认保存在 `~/.xueqiu-mcp/cookies.json`，目录权限为 `0700`、文件权限为 `0600`，采用原子写入。**这是本地文件权限保护，不是加密存储。** 服务启动时自动加载，`XUEQIU_COOKIE` 环境变量优先于本地文件，保存位置可通过 `XUEQIU_COOKIE_FILE` 修改。
+凭证默认保存在 `~/.xueqiu-mcp/cookies.json`，新建的凭证目录权限为 `0700`、文件权限为 `0600`，采用原子写入。可用 `XUEQIU_CREDENTIAL_DIR` 指定目录，或用优先级更高的 `XUEQIU_COOKIE_FILE` 指定完整文件名。首选位置无法写入时，依次尝试用户主目录下的备用目录、当前用户独占的系统临时目录。临时文件可能被系统清理；在容器中需要长期保存时，请指定可写的持久卷。服务启动时优先使用 `XUEQIU_COOKIE`，否则读取对应位置中最近保存的凭证。
 
 <details>
 <summary>其他登录方式与凭证处理</summary>
@@ -359,6 +361,7 @@ export XUEQIU_PUBLIC_BASE_URL=https://mcp.example.com/xueqiu
 | `XUEQIU_STATELESS` | `1` | Streamable HTTP 无状态会话开关 |
 | `XUEQIU_COOKIE` | 空 | 登录 Cookie，优先于本地文件 |
 | `XUEQIU_COOKIE_FILE` | `~/.xueqiu-mcp/cookies.json` | 凭证文件位置 |
+| `XUEQIU_CREDENTIAL_DIR` | `~/.xueqiu-mcp` | 凭证目录，浏览器 profile 默认随可写目录存放 |
 | `XUEQIU_PUBLIC_BASE_URL` | 空 | 远程扫码网页的对外基础地址 |
 | `XUEQIU_MCP_LOG` | `INFO` | 日志级别 |
 

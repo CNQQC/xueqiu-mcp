@@ -311,7 +311,7 @@ HK_INDICATOR_FIELDS: dict[str, tuple[str, str]] = {
     "beps": ("每股基本盈利", "yuan"),
     "beps_aju": ("每股基本盈利(调整)", "yuan"),
     "bps": ("每股账面净值", "yuan"),
-    "dps": ("每股股息(仙)", "plain"),
+    "dps": ("每股股息指标（雪球 dps，仙）", "cent_per_share"),
     "ttops": ("每股营业额", "yuan"),
     "tsrps": ("每股收入总额", "yuan"),
     "opps": ("每股经营溢利", "yuan"),

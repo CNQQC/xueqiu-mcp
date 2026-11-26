@@ -24,8 +24,8 @@
 凭证存哪
 --------
 默认 ``~/.xueqiu-mcp/cookies.json``，目录 0700、文件 0600，写入走临时文件 +
-``os.replace``，避免写到一半进程挂掉留下半个文件。可用 ``XUEQIU_COOKIE_FILE``
-指定别的位置。
+``os.replace``，避免写到一半进程挂掉留下半个文件。可用 ``XUEQIU_CREDENTIAL_DIR``
+指定目录，或用 ``XUEQIU_COOKIE_FILE`` 指定文件。写入失败时尝试主目录或私有临时目录。
 
 优先级：构造参数 > ``XUEQIU_COOKIE`` 环境变量 > 凭证文件。环境变量优先于文件，
 是为了让服务器部署能用一次性注入的凭证覆盖机器上残留的登录态。
@@ -34,9 +34,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
+import stat
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -133,11 +136,84 @@ def is_logged_in(jar: dict[str, str]) -> bool:
 
 
 # --------------------------------------------------------------------- 凭证文件
+def _store_locations():
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
+    filename = os.getenv("XUEQIU_COOKIE_FILE", "").strip()
+    directory = os.getenv("XUEQIU_CREDENTIAL_DIR", "").strip()
+    preferred = home / ".xueqiu-mcp" / "cookies.json" if home else None
+    if filename:
+        preferred = Path(filename).expanduser()
+    elif directory:
+        preferred = Path(directory).expanduser() / "cookies.json"
+    if preferred:
+        yield preferred, "configured" if filename or directory else "home"
+    # 同一系统用户可能运行多个账号。备用目录按首选路径隔离。
+    scope = hashlib.sha256(os.fsencode(preferred.absolute() if preferred else "default")).hexdigest()[:16]
+    if home:
+        # ~/.xueqiu-mcp 本身可能是只读挂载，备用目录须位于该挂载之外。
+        yield home / ".local" / "state" / "xueqiu-mcp" / scope / "cookies.json", "home_fallback"
+    try:
+        temp_root = Path(tempfile.gettempdir())
+    except OSError:
+        return
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    yield temp_root / f"xueqiu-mcp-{uid}-{scope}" / "cookies.json", "temporary"
+
+
+def _check_directory(path: Path, kind: str, *, create: bool) -> None:
+    if create:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if kind == "temporary":
+        info = path.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or (hasattr(os, "getuid") and
+                (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)):
+            raise PermissionError("临时凭证目录须为当前用户独占")
+
+
+def storage_status() -> dict:
+    """用实际创建和移除临时文件探测服务进程权限，包括只读挂载。"""
+    preferred = None
+    for path, kind in _store_locations():
+        preferred = preferred or path
+        try:
+            _check_directory(path, kind, create=True)
+            if path.is_dir():
+                continue
+            with tempfile.NamedTemporaryFile(dir=path.parent):
+                pass
+        except OSError:
+            continue
+        return {"directory": str(path.parent), "file": str(path), "writable": True, "location": kind,
+                "preferred_directory": str(preferred.parent)}
+    return {"directory": str(preferred.parent) if preferred else None, "file": str(preferred) if preferred else None, "writable": False,
+            "location": None, "preferred_directory": str(preferred.parent) if preferred else None}
+
+
+def _existing_stores():
+    found = []
+    for path, kind in _store_locations():
+        try:
+            _check_directory(path, kind, create=False)
+            info = path.stat()
+            if stat.S_ISREG(info.st_mode):
+                found.append((info.st_mtime_ns, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(found, key=lambda pair: pair[0], reverse=True)]
+
+
 def store_path() -> Path:
-    custom = os.getenv("XUEQIU_COOKIE_FILE", "").strip()
-    if custom:
-        return Path(custom).expanduser()
-    return Path.home() / ".xueqiu-mcp" / "cookies.json"
+    """当前凭证读取路径，兼容只读挂载和此前保存的备用文件。"""
+    existing = _existing_stores()
+    if existing:
+        return existing[0]
+    status = storage_status()
+    if status["file"]:
+        return Path(status["file"])
+    raise LoginError("找不到凭证目录，请设置 XUEQIU_CREDENTIAL_DIR。")
 
 
 def load_store() -> dict[str, Any]:
@@ -145,7 +221,10 @@ def load_store() -> dict[str, Any]:
 
     凭证文件坏掉不该让整个 MCP Server 起不来 —— 大不了退回匿名模式。
     """
-    path = store_path()
+    paths = _existing_stores()
+    if not paths:
+        return {}
+    path = paths[0]
     try:
         data = json.loads(path.read_text("utf-8"))
     except FileNotFoundError:
@@ -163,8 +242,6 @@ def load_saved_cookies() -> dict[str, str]:
 
 def save_cookies(jar: dict[str, str], user: dict[str, Any] | None = None) -> Path:
     """把凭证写入文件（0600），返回文件路径。"""
-    path = store_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "version": STORE_VERSION,
         "saved_at": int(time.time()),
@@ -173,23 +250,33 @@ def save_cookies(jar: dict[str, str], user: dict[str, Any] | None = None) -> Pat
         "cookies": jar,
     }
     # 临时文件 + 原子替换：中途失败不会留下半份凭证覆盖掉原来能用的那份
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), "utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    return path
+    for path, kind in _store_locations():
+        tmp = None
+        try:
+            _check_directory(path, kind, create=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+                tmp = Path(f.name)
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            return path
+        except OSError:
+            continue
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    raise LoginError("所有凭证目录均无法写入，请将 XUEQIU_CREDENTIAL_DIR 指向可写目录。")
 
 
 def clear_cookies() -> bool:
     """删除凭证文件。返回是否真的删掉了东西。"""
-    path = store_path()
-    try:
-        path.unlink()
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError as exc:  # pragma: no cover
-        raise LoginError(f"无法删除凭证文件 {path}：{exc}") from exc
+    removed = False
+    for path in _existing_stores():
+        try:
+            path.unlink(missing_ok=True)
+            removed = True
+        except OSError as exc:
+            raise LoginError(f"无法删除凭证文件 {path}：{exc}") from exc
+    return removed
 
 
 # --------------------------------------------------------------------- 凭证来源

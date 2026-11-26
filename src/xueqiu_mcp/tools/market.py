@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..client import get_client
+from ..results import field_unit, records, select_fields
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, md_table
 from ..screener import CATEGORIES, load_metrics, metric_label, validate
 from ..symbols import is_resolvable, market_of, normalize_symbol
@@ -55,7 +56,8 @@ async def screen_stocks(
     industry: str | None = None,
     exchange: str | None = None,
     columns: str | None = None,
-) -> str:
+    format: str = "markdown",
+) -> str | dict:
     """按指标筛选并排序股票。
 
     filters 写成 ``指标:下限~上限``，多条用逗号分隔，边界可留空：
@@ -112,7 +114,7 @@ async def screen_stocks(
     )
     d = data.get("data") or {}
     rows_raw = d.get("list") or []
-    if not rows_raw:
+    if not rows_raw and format != "json":
         return "没有符合条件的标的，可放宽筛选范围。"
 
     cols = list(_BASE_COLS)
@@ -121,6 +123,12 @@ async def screen_stocks(
             cols.append(k)
     cols = [c for c in cols if any(c in r for r in rows_raw)]
 
+    if format == "json":
+        currency = _MARKET_CURRENCY[market]
+        units = {k: field_unit(_UNITS.get(k, "plain"), currency) for k in cols}
+        units["current"] = currency
+        return records([select_fields(it, cols) for it in rows_raw], limit, 100, page=params["page"], pageable=True,
+                       total=d.get("count"), market=market, units=units, currency=currency)
     headers = [_BASE_LABELS.get(c) or await metric_label(market, c) for c in cols]
     rows = [[_render(c, r.get(c), market) for c in cols] for r in rows_raw]
 
@@ -162,12 +170,15 @@ def _parse_filters(raw: str | None) -> list[tuple[str, str, str]]:
     return out
 
 
-async def list_screener_metrics(market: str = "CN", keyword: str | None = None) -> str:
+async def list_screener_metrics(market: str = "CN", keyword: str | None = None, format: str = "markdown") -> str | dict:
     """列出选股器在该市场支持的全部指标（雪球官方元数据）。"""
     market = (market or "CN").upper()
     if market not in CATEGORIES:
         return f"market 仅支持：{', '.join(CATEGORIES)}"
     metrics = await load_metrics(market)
+    if format == "json":
+        return records([{"key": key, **m} for key, m in metrics.items()
+                        if not keyword or keyword in m["name"] or keyword.lower() in key.lower()], market=market)
     if not metrics:
         return "未取到指标清单。"
 
@@ -195,7 +206,7 @@ async def list_screener_metrics(market: str = "CN", keyword: str | None = None) 
     return "\n".join(out)
 
 
-async def list_industries(market: str = "CN") -> str:
+async def list_industries(market: str = "CN", format: str = "markdown") -> str | dict:
     """申万行业分类；encode 可作为 screen_stocks 的 industry 参数。"""
     market = (market or "CN").upper()
     if market not in MARKETS:
@@ -205,6 +216,8 @@ async def list_industries(market: str = "CN") -> str:
         "/v5/stock/screener/industries.json", {"category": mtype, "type": mtype}
     )
     inds = (data.get("data") or {}).get("industries") or []
+    if format == "json":
+        return records([select_fields(i, ("encode", "name", "pinyin")) for i in inds], market=market)
     if not inds:
         return "未取到行业列表。"
     rows = [[i.get("encode", ""), i.get("name", ""), i.get("pinyin", "")] for i in inds]
@@ -215,7 +228,7 @@ async def list_industries(market: str = "CN") -> str:
     )
 
 
-async def get_hot_stocks(market: str = "CN", limit: int = 20) -> str:
+async def get_hot_stocks(market: str = "CN", limit: int = 20, format: str = "markdown") -> str | dict:
     """雪球人气榜（按用户关注热度排序）。"""
     market = (market or "CN").strip().upper()
     if market not in HOT_MARKETS:
@@ -225,13 +238,17 @@ async def get_hot_stocks(market: str = "CN", limit: int = 20) -> str:
         {"size": max(1, min(int(limit), 100)), "type": HOT_MARKETS[market]},
     )
     items = (data.get("data") or {}).get("items") or []
-    if not items:
+    if not items and format != "json":
         return "未取到人气榜数据。"
     rows = []
+    raw_rows = []
     for i, it in enumerate(items, 1):
         symbol = normalize_symbol(str(it.get("symbol") or it.get("code") or ""))
         if not is_resolvable(symbol) or market_of(symbol) != market:
             return f"雪球人气榜第 {i} 名的代码（{symbol or '缺失'}）无法匹配请求的{MARKETS[market][0]}市场。"
+        if format == "json":
+            raw_rows.append({**select_fields(it, ("name", "current", "percent", "value", "increment")), "symbol": symbol, "rank": i})
+            continue
         rows.append([
             str(i),
             symbol,
@@ -241,6 +258,9 @@ async def get_hot_stocks(market: str = "CN", limit: int = 20) -> str:
             fmt_num(it.get("value")),
             f"{it.get('increment'):+d}" if isinstance(it.get("increment"), int) else "-",
         ])
+    if format == "json":
+        return records(raw_rows, limit, 100, market=market, units={"current": _MARKET_CURRENCY[market],
+                       "percent": "percent", "value": "heat", "increment": "heat"})
     return (
         f"### 雪球{MARKETS[market][0]}人气榜 Top {len(rows)}\n"
         "「热度」为雪球用户关注度指标，「热度变化」为较上一时段增减。\n\n"

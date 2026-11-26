@@ -53,7 +53,11 @@ async def _finish(jar: dict[str, str], remember: bool) -> int:
 
     print(f"✅ 登录成功：{user.get('screen_name')}（用户 ID {user.get('id')}）")
     if remember:
-        path = auth.save_cookies(jar, {"id": user.get("id"), "screen_name": user.get("screen_name")})
+        try:
+            path = auth.save_cookies(jar, {"id": user.get("id"), "screen_name": user.get("screen_name")})
+        except auth.LoginError as exc:
+            print(f"凭证保存失败：{exc}", file=sys.stderr)
+            return 1
         print(f"   凭证已保存到 {path}（权限 0600）")
     else:
         print("   按要求未落盘，本次校验通过但不会被后续进程读到。")

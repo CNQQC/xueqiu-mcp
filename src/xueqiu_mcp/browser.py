@@ -48,6 +48,7 @@ import asyncio
 import base64
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -96,7 +97,10 @@ def profile_dir() -> Path:
     custom = os.getenv("XUEQIU_BROWSER_PROFILE", "").strip()
     if custom:
         return Path(custom).expanduser()
-    return auth.store_path().parent / "browser"
+    directory = auth.storage_status()["directory"]
+    if directory is None:
+        raise BrowserUnavailable("找不到浏览器数据目录，请设置 XUEQIU_BROWSER_PROFILE。")
+    return Path(directory) / "browser"
 
 
 def available() -> bool:
@@ -108,6 +112,45 @@ def available() -> bool:
     except ImportError:
         return False
     return True
+
+
+_probe_cache = None
+_probe_lock = asyncio.Lock()
+
+
+async def browser_status() -> dict:
+    """探测扫码所需的 Chromium。复用 60 秒内的结果，不打开登录页。"""
+    global _probe_cache
+    if not _env_flag("XUEQIU_BROWSER", True):
+        return {"available": False, "reason": "已通过 XUEQIU_BROWSER 禁用"}
+    if not available():
+        return {"available": False, "reason": "未安装 Playwright，请安装 xueqiu-mcp[browser] 和 Chromium"}
+    if _session is not None and _session.running:
+        return {"available": True, "reason": "Chromium 正在运行"}
+    headless = _env_flag("XUEQIU_BROWSER_HEADLESS", True)
+    key = (headless, os.getenv("PLAYWRIGHT_BROWSERS_PATH"), os.getenv("DISPLAY"), os.getenv("WAYLAND_DISPLAY"))
+    async with _probe_lock:
+        if _probe_cache and _probe_cache[0] == key and time.monotonic() < _probe_cache[1]:
+            return _probe_cache[2]
+        from playwright.async_api import async_playwright
+
+        try:
+            async with async_playwright() as pw:
+                if headless:
+                    instance = await pw.chromium.launch(headless=True, timeout=5000)
+                    await instance.close()
+                    status = {"available": True, "reason": "Chromium 已通过无头启动检测"}
+                else:
+                    display = not sys.platform.startswith("linux") or bool(key[2] or key[3])
+                    ready = os.access(pw.chromium.executable_path, os.X_OK) and display
+                    status = {"available": ready, "reason": "窗口模式内核与显示环境已就绪（未打开窗口）"
+                              if ready else "窗口模式缺少 Chromium 可执行文件或显示环境"}
+        except Exception as exc:
+            reason = ("未找到 Chromium，请运行 playwright install chromium"
+                      if "Executable doesn't exist" in str(exc) else "Chromium 启动检测失败，请检查内核和系统依赖")
+            status = {"available": False, "reason": reason}
+        _probe_cache = key, time.monotonic() + 60, status
+        return status
 
 
 # --------------------------------------------------------------------- 二维码

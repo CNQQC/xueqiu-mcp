@@ -7,6 +7,7 @@ import asyncio
 from ..client import gather_json, get_client
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, fmt_ts, md_table
 from ..resolve import resolve_symbol
+from ..results import iso_time, records, select_fields
 
 _COMPANY_LAYOUT = [
     ("org_name_cn", "公司全称"), ("org_short_name_cn", "简称"), ("org_name_en", "英文名"),
@@ -19,7 +20,7 @@ _COMPANY_LAYOUT = [
 ]
 
 
-async def get_company_profile(symbol: str) -> str:
+async def get_company_profile(symbol: str, format: str = "markdown") -> str | dict:
     """公司基本资料 + 所属行业与概念板块。"""
     sym = await resolve_symbol(symbol)
     client = get_client()
@@ -33,6 +34,12 @@ async def get_company_profile(symbol: str) -> str:
     if isinstance(data, BaseException):
         raise data
     c = (data.get("data") or {}).get("company") or {}
+    if format == "json":
+        keys = [k for k, _ in _COMPANY_LAYOUT] + ["main_operation_business", "org_cn_introduction", "operating_scope"]
+        ind = {} if isinstance(ind_raw, BaseException) else ind_raw.get("data") or {}
+        return {"symbol": sym, "company": select_fields(c, keys, dates={"established_date", "listed_date"}),
+                "industries": ind.get("industry") or [], "concepts": ind.get("concept") or [],
+                "units": {"reg_asset": "CNY", "staff_num": "people"}}
     if not c:
         return f"{sym} 无公司资料（该接口仅覆盖 A 股）。"
 
@@ -68,7 +75,7 @@ async def get_company_profile(symbol: str) -> str:
     return "\n".join(lines)
 
 
-async def get_shareholders(symbol: str, top_n: int = 10) -> str:
+async def get_shareholders(symbol: str, top_n: int = 10, format: str = "markdown") -> str | dict:
     """股东结构：股东户数走势、十大流通股东、机构持仓概览。"""
     sym = await resolve_symbol(symbol)
     client = get_client()
@@ -81,6 +88,20 @@ async def get_shareholders(symbol: str, top_n: int = 10) -> str:
         client.get("/v5/stock/f10/cn/org_holding/detail.json", {"symbol": sym, "page": 1, "size": 10}),
     )
 
+    if format == "json":
+        h = (h_raw.get("data") or {}).get("items") or []
+        t = t_raw.get("data") or {}
+        o = o_raw.get("data") or {}
+        holders = (t.get("items") or [])[:max(1, min(top_n, 20))]
+        return records([select_fields(i, ("holder_name", "held_num", "held_ratio", "chg")) for i in holders],
+                       top_n, 20, symbol=sym,
+                       history=[select_fields(i, ("timestamp", "ashare_holder", "chg", "per_float", "per_amount",
+                               "top_holder_ratio"), dates={"timestamp"}) for i in h[:8]],
+                       institutions={k: [select_fields(i, ("org_name_or_fund_name", "held_num", "to_float_shares_ratio"))
+                                     for i in v] for k, v in o.items() if k.endswith("_items") and isinstance(v, list)},
+                       units={"held_num": "shares", "held_ratio": "percent", "chg": "percent", "per_amount": "CNY",
+                              "per_float": "shares", "ashare_holder": "accounts", "to_float_shares_ratio": "percent",
+                              "top_holder_ratio": "percent"})
     # 股东户数
     items = (h_raw.get("data") or {}).get("items") or []
     if items:
@@ -156,7 +177,7 @@ async def get_shareholders(symbol: str, top_n: int = 10) -> str:
     return "\n".join(out) if len(out) > 1 else f"{sym} 暂无股东数据（该接口仅覆盖 A 股）。"
 
 
-async def get_dividends(symbol: str, count: int = 10) -> str:
+async def get_dividends(symbol: str, count: int = 10, format: str = "markdown") -> str | dict:
     """历年分红送配方案。"""
     sym = await resolve_symbol(symbol)
     data = await get_client().get(
@@ -165,6 +186,12 @@ async def get_dividends(symbol: str, count: int = 10) -> str:
     )
     d = data.get("data") or {}
     items = d.get("items") or []
+    if format == "json":
+        dates = ("equity_date", "ashare_ex_dividend_date", "ex_dividend_date", "dividend_date", "listing_date")
+        keys = ("dividend_year", "plan_explain", *dates)
+        return records([select_fields(i, keys, dates) for i in items], count, 50, symbol=sym,
+                       allots=[select_fields(i, keys, dates) for i in d.get("allots") or []],
+                       additions=[select_fields(i, keys, dates) for i in d.get("addtions") or []])
     if not items:
         return f"{sym} 无分红记录。"
 

@@ -50,7 +50,7 @@ async def resolve_symbol(raw: str) -> str:
     return hits[0]["symbol"]
 
 
-async def resolve_many(raw: str | list[str]) -> list[str]:
+async def resolve_many(raw: str | list[str], *, unresolved: list[str] | None = None) -> list[str]:
     """解析多个标的，保持输入顺序并去重。
 
     能按规则判定的代码直接就地规范化；只有中文名之类需要走搜索的才发请求，
@@ -72,9 +72,13 @@ async def resolve_many(raw: str | list[str]) -> list[str]:
             pending.append((i, p))
 
     if pending:
-        # 任一解析失败就整体抛出，与逐个 await 时的行为一致
-        hits = await asyncio.gather(*(resolve_symbol(p) for _, p in pending))
-        for (i, _), hit in zip(pending, hits):
+        hits = await asyncio.gather(*(resolve_symbol(p) for _, p in pending), return_exceptions=True)
+        for (i, name), hit in zip(pending, hits):
+            if isinstance(hit, ValueError) and unresolved is not None:
+                unresolved.append(name)
+                continue
+            if isinstance(hit, BaseException):
+                raise hit
             resolved[i] = hit
 
     out: list[str] = []
