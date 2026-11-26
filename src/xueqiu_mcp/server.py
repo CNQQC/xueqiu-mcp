@@ -39,7 +39,8 @@ INSTRUCTIONS = """雪球(xueqiu.com)数据服务，覆盖 A 股 / 港股 / 美�
 数据均为雪球公开数据，行情可能有延迟，不构成投资建议。
 
 默认匿名工作，行情 / 财务 / 选股等公开数据无需登录。
-只读工具使用 format=json 返回原始数值和 ISO 时间。翻页请沿 pagination.next_page 续读，评论传 comment_page。
+只读工具传 format=json 可取得原始数值和 ISO 时间。评论用 page=next_page 续读，热帖用 cursor=next_cursor。
+回测搜帖可同时传 since、until、original_only、exact_phrase 和 deduplicate。按 ID 核对作者资料用 get_user_profile。
 
 查某个人的一手观点时，先 search_users 找到并核对账号，再 search_posts(query=主题词,
 user_id=该账号ID)。不要仅把人名拼进全站搜索的 query，否则会搜到别人讨论他或转载他的帖子。
@@ -385,13 +386,16 @@ async def get_stock_news(
 
 
 @mcp.tool()
-async def get_hot_posts(count: int = 10, page: int = 1, format: OutputFormat = "markdown") -> CallToolResult:
-    """雪球首页热门讨论。首页 page=1，续读传入上次返回的 next_page 游标。
+async def get_hot_posts(count: int = 10, page: int = 1, format: OutputFormat = "markdown",
+                        cursor: int | None = None) -> CallToolResult:
+    """雪球首页热门讨论。首页省略 cursor，续读时将 pagination.next_cursor 原样传给 cursor。
 
     Args:
         count: 条数，最多 30
+        page: 旧版入口，1 表示首页，其余值为上游游标
+        cursor: 上次返回的游标
     """
-    value = await social.get_hot_posts(count, page=page, format=format)
+    value = await social.get_hot_posts(count, page=page, format=format, cursor=cursor)
     return tool_result(value, format)
 
 
@@ -413,11 +417,18 @@ async def search_users(query: str, count: int = 10, page: int = 1, format: Outpu
 
 
 @mcp.tool()
+async def get_user_profile(user_id: str, format: OutputFormat = "markdown") -> CallToolResult:
+    """按雪球用户 ID 或主页链接查询公开资料，包括注册时间、粉丝数、关注数和发帖数。"""
+    return tool_result(await social.get_user_profile(user_id, format=format), format)
+
+
+@mcp.tool()
 async def search_posts(
     query: str, count: int = 10, page: int | str = 1, user_id: str | None = None,
     since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: OutputFormat = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
+    exclude_content_hashes: list[str] | None = None,
 ) -> CallToolResult:
     """搜索雪球帖子及关键词附近原文摘录，可限定作者并校验作者 ID。
 
@@ -431,6 +442,7 @@ async def search_posts(
         query: 关键词，如「宇树」「红利策略」
         exact_phrase: 在标题或可见正文（无正文时用摘要）中匹配完整连续短语
         deduplicate: 在当前结果页按规范化内容哈希去重，保留首条；JSON 提供 content_hash 便于跨页比对
+        exclude_content_hashes: 排除之前已保存的非空 content_hash，可跨页或跨调用去重
         count: 条数，最多 30
         page: 页码
         user_id: 雪球用户数字 ID 或主页/帖子链接，可先用 search_users 查找；不填则全站搜索
@@ -438,7 +450,7 @@ async def search_posts(
     value = await social.search_posts(
         query, count, page, user_id,
         since_id=since_id, since=since, until=until, original_only=original_only, min_followers=min_followers, format=format,
-        exact_phrase=exact_phrase, deduplicate=deduplicate,
+        exact_phrase=exact_phrase, deduplicate=deduplicate, exclude_content_hashes=exclude_content_hashes,
     )
     return tool_result(value, format)
 
@@ -446,11 +458,11 @@ async def search_posts(
 @mcp.tool()
 async def get_post(
     post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True,
-    comment_page: int = 1, format: OutputFormat = "markdown",
+    comment_page: int = 1, format: OutputFormat = "markdown", page: int | None = None,
 ) -> CallToolResult:
     """按帖子 ID 取全文及最新评论（按时间倒序）。ID 可从讨论列表或热帖列表中获得。
 
-    返回发布时间和编辑状态。雪球提供编辑时间时显示“已编辑”和北京时间，否则显示“未知”。
+    返回发布时间、原始编辑字段和编辑状态。空值标为未编辑，字段缺失或值异常标为未知。
     正文残缺时（雪球置了 truncated，或正文为空的付费 / 仅粉丝可见内容）会用本机
     浏览器把完整正文取回来，需要装浏览器支持，没装就照常返回并给出提示。
 
@@ -458,12 +470,13 @@ async def get_post(
         post_id: 帖子数字 ID，或完整帖子链接
         with_comments: 是否附带评论
         comment_count: 每页评论条数，最多 30
-        comment_page: 评论页码，从 1 起，按 pagination.next_page 继续
+        page: 评论页码，从 1 起，续读时传 pagination.next_page
+        comment_page: 兼容旧调用的评论页码
         full_text: 正文被截断时是否用本地浏览器补全；设 false 可省掉这次开销
     """
     value = await social.get_post(
         post_id, with_comments, comment_count, full_text,
-        comment_page=comment_page, format=format,
+        comment_page=comment_page, format=format, page=page,
     )
     return tool_result(value, format)
 

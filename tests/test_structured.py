@@ -32,7 +32,7 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
             ids = []
             page = 1
             while page is not None:
-                result = await server.get_post("99", comment_count=30, comment_page=page, format="json")
+                result = await server.get_post("99", comment_count=30, page=page, format="json")
                 data = json.loads(result.content[0].text)
                 self.assertEqual(data, result.model_dump(by_alias=True)["structuredContent"])
                 ids.extend(c["id"] for c in data["comments"])
@@ -66,7 +66,8 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
         client.get.side_effect = [feed([9, 8, 7, 6, 5]), feed([7, 6, 5, 4, 3])]
         with patch.object(social, "get_client", return_value=client):
             first = await social.get_hot_posts(2, format="json")
-            second = await social.get_hot_posts(2, page=first["pagination"]["next_page"], format="json")
+            self.assertEqual(first["pagination"]["next_cursor"], first["pagination"]["next_page"])
+            second = await social.get_hot_posts(2, cursor=first["pagination"]["next_cursor"], format="json")
         self.assertEqual([p["id"] for p in first["items"] + second["items"]], ["9", "7", "5", "3"])
 
     def test_record_and_bounds(self):
@@ -79,6 +80,14 @@ class StructuredTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["view_count"], 0)
         self.assertIsNone(result["reply_count"])
         self.assertIsNone(result["edited_at"])
+        self.assertEqual(result["edit_status"], "unknown")
+        self.assertFalse(result["edited_at_present"])
+        edited = post_record({**raw, "edited_at": None, "retweeted_status": {**raw, "edited_at": raw["created_at"] + 1}})
+        self.assertEqual(edited["edit_status"], "unedited")
+        self.assertTrue(edited["edited_at_present"])
+        self.assertIsNone(edited["edited_at_raw"])
+        self.assertTrue(edited["retweeted_status"]["edited_after_creation"])
+        self.assertEqual(edited["retweeted_status"]["edited_at_raw"], raw["created_at"] + 1)
         self.assertTrue(result["created_at"].endswith("+08:00"))
         self.assertEqual(filter_posts([raw], None, "2026-06-02", "2026-06-02", False, None), [raw])
         self.assertFalse(filter_posts([raw], None, None, "2026-06-02T09:32:23+08:00", False, None))

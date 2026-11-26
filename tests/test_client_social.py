@@ -194,9 +194,11 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_edit_evidence_stays_unknown(self):
         permissions = {"editable": True, "canEdit": True, "updated_at": 1780363943000}
-        for extra in ({}, {"edited_at": None}, {"edited_at": 0}, {"edited_at": True}, {"edited_at": "bad"}):
+        for extra in ({}, {"edited_at": 0}, {"edited_at": True}, {"edited_at": "bad"}):
             with self.subTest(extra=extra):
-                self.assertEqual(social._edit_status({**permissions, **extra}), "编辑状态：未知")
+                self.assertIn("编辑状态：未知", social._edit_status({**permissions, **extra}))
+        self.assertIn("编辑状态：未编辑　原始 edited_at=null", social._edit_status({"edited_at": None}))
+        self.assertIn("原始 edited_at=字段缺失", social._edit_status({}))
 
     async def test_partial_nickname_does_not_pick_first_same_name_account(self):
         client = AsyncMock()
@@ -386,7 +388,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await server.search_posts("红利", user_id="123")).content[0].text, "ok")
             search.assert_awaited_once_with("红利", 10, 1, "123", since_id=None, since=None, until=None,
                                            original_only=False, min_followers=None, format="markdown",
-                                           exact_phrase=False, deduplicate=True)
+                                           exact_phrase=False, deduplicate=True, exclude_content_hashes=None)
 
 
 if __name__ == "__main__":

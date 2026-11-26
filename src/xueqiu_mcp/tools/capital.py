@@ -17,7 +17,20 @@ ORDER_LEVELS = (("特大单", "xlarge"), ("大单", "large"), ("中单", "medium
                 ("小单", "small"), ("合计", "total"))
 FLOW_NOTE = ("每日主力净流入取自雪球 capital/history 的 amount。成交单结构取自 capital/assort，"
              "各档净额按流入减流出计算，合计使用该接口的流入、流出总额。"
-             "两接口的统计口径独立。缺失金额显示为「未提供」，不以差额推算特大单。")
+             "两接口的统计口径独立。")
+
+
+def _order_layout(amounts: dict) -> str:
+    if any(amounts.get(f"{side}_xlarge") is not None for side in ("buy", "sell")):
+        return "xlarge_reported"
+    for side in ("buy", "sell"):
+        values = [amounts.get(f"{side}_{level}") for level in ("large", "medium", "small", "total")]
+        if any(v is None for v in values):
+            return "undetermined"
+        large, medium, small, total = (Decimal(str(v)) for v in values)
+        if large + medium + small != total:
+            return "undetermined"
+    return "three_reported_bands"
 
 
 async def get_capital_flow(symbol: str, days: int = 10, exclude_today: bool = False, format: str = "markdown") -> str | dict:
@@ -55,7 +68,12 @@ async def get_capital_flow(symbol: str, days: int = 10, exclude_today: bool = Fa
     if exclude_today and (not assort_stamp or datetime.fromisoformat(assort_stamp).date() == observed.date()):
         a = {}
     order_flow = None
+    layout = None
+    methodology = FLOW_NOTE
     if a:
+        layout = _order_layout(a)
+        if layout == "three_reported_bands":
+            methodology += "买卖两侧的大、中、小单之和分别等于合计；雪球本次仅列三档，特大单未单列。"
         order_flow = {"timestamp": assort_stamp}
         for _, level in ORDER_LEVELS:
             buy, sell = a.get(f"buy_{level}"), a.get(f"sell_{level}")
@@ -66,7 +84,7 @@ async def get_capital_flow(symbol: str, days: int = 10, exclude_today: bool = Fa
     if format == "json":
         return records(items, requested, 60, symbol=sym, windows=windows, exclude_today=exclude_today,
                        units={"amount": snapshot["currency"], "order_flow": snapshot["currency"]},
-                       order_flow=order_flow, methodology=FLOW_NOTE,
+                       order_flow=order_flow, order_flow_layout=layout, methodology=methodology,
                        is_partial=partial, **snapshot)
     out = [f"### {sym} 资金流向\n"]
     if items:
@@ -80,11 +98,15 @@ async def get_capital_flow(symbol: str, days: int = 10, exclude_today: bool = Fa
     if order_flow:
         rows = []
         for label, level in ORDER_LEVELS:
+            if layout == "three_reported_bands" and level == "xlarge":
+                continue
+            if layout == "three_reported_bands" and level == "large":
+                label = "大单（特大单未单列）"
             values = [order_flow[f"{side}_{level}"] for side in ("buy", "sell", "net")]
             rows.append([label, *(fmt_money(v) if v is not None else "未提供" for v in values)])
         out.append(f"\n**成交单结构（{fmt_ts(a.get('timestamp'))}）**\n")
         out.append(md_table(["类型", "流入", "流出", "净额"], rows))
-        out.append(FLOW_NOTE)
+        out.append(methodology)
 
     return "\n".join(out) if len(out) > 1 else f"{sym} 暂无资金流数据。"
 

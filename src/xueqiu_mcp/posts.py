@@ -41,6 +41,22 @@ def _integer(value):
     return None
 
 
+def edit_fields(post: dict) -> dict:
+    present = "edited_at" in post
+    raw = post.get("edited_at")
+    millis = _integer(raw)
+    edited = iso_time(millis) if millis is not None and millis > 0 else None
+    created = _integer(post.get("created_at"))
+    status, later = "unknown", None
+    if edited:
+        status = "edited"
+        later = millis > created if created is not None and created > 0 else None
+    elif present and (raw is None or raw == ""):
+        status, later = "unedited", False
+    return {"edit_status": status, "edited_at": edited, "edited_at_raw": raw,
+            "edited_at_present": present, "edited_after_creation": later}
+
+
 def post_record(post: dict) -> dict:
     user = post.get("user") or {}
     original = post.get("retweeted_status") or {}
@@ -56,8 +72,11 @@ def post_record(post: dict) -> dict:
         "id": str(post["id"]) if post.get("id") is not None else None,
         "author_id": str(author_id) if author_id is not None else None,
         "author_name": user.get("screen_name"), "followers_count": _integer(user.get("followers_count")),
-        "created_at": iso_time(post.get("created_at")), "edited_at": iso_time(post.get("edited_at")),
+        "created_at": iso_time(post.get("created_at")), **edit_fields(post),
         "is_retweet": bool(original_id or original), "retweeted_status_id": str(original_id) if original_id else None,
+        "retweeted_status": ({"id": str(original_id) if original_id else None,
+                              "created_at": iso_time(original.get("created_at")), **edit_fields(original)}
+                             if original else None),
         "title": title, "text": text, "author_text": own.strip(),
         "quoted_text": "//@" + quoted[0] if quoted else None, "url": post_url(post),
         "symbols": [{"name": name, "code": code} for name, code in symbols],

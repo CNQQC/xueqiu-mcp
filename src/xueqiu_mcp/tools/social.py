@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime
@@ -19,9 +20,9 @@ from urllib.parse import urlparse
 import httpx
 
 from ..client import APP_API, XueqiuError, get_client
-from ..formatting import CN_TZ, fmt_count, fmt_ts, post_url, strip_html
-from ..posts import content_hash, filter_posts, post_record, search_text
-from ..results import pagination, page_text, records
+from ..formatting import fmt_count, fmt_ts, post_url, strip_html
+from ..posts import content_hash, edit_fields, filter_posts, post_record, search_text
+from ..results import iso_time, pagination, page_text, records
 from ..resolve import resolve_symbol
 
 log = logging.getLogger("xueqiu_mcp")
@@ -76,14 +77,12 @@ def _excerpt(text: str, limit: int | None, query: str = "") -> str:
 
 def _edit_status(st: dict) -> str:
     """雪球用毫秒时间戳 edited_at 记录编辑，editable 和 canEdit 表示权限。"""
-    try:
-        millis = int(str(st.get("edited_at")))
-        if millis > 0:
-            edited = datetime.fromtimestamp(millis / 1000, CN_TZ)
-            return f"编辑状态：已编辑（{edited:%Y-%m-%d %H:%M:%S}）"
-    except (ValueError, OverflowError, OSError):
-        pass
-    return "编辑状态：未知"
+    fields = edit_fields(st)
+    label = {"edited": "已编辑", "unedited": "未编辑", "unknown": "未知"}[fields["edit_status"]]
+    if fields["edited_at"]:
+        label += f"（{datetime.fromisoformat(fields['edited_at']):%Y-%m-%d %H:%M:%S}）"
+    raw = json.dumps(fields["edited_at_raw"], ensure_ascii=False) if fields["edited_at_present"] else "字段缺失"
+    return f"编辑状态：{label}　原始 edited_at={raw}"
 
 
 def _post_body(st: dict, limit: int | None, query: str = "") -> str:
@@ -193,6 +192,7 @@ async def _fetch_post_page(
     if retry:
         meta["retry_page"] = page
     meta["upstream_max_page"] = data.get("maxPage")
+    meta["upstream_page_size"] = batch_size
     return posts, meta, note
 
 
@@ -265,8 +265,13 @@ async def get_stock_news(symbol: str, kind: str = "news", count: int = 10, page:
     return "\n\n".join(out)
 
 
-async def get_hot_posts(count: int = 10, page: int = 1, format: str = "markdown") -> str | dict:
-    """page=1 取首页，后续传上次返回的 next_page 游标。"""
+async def get_hot_posts(count: int = 10, page: int = 1, format: str = "markdown",
+                        cursor: int | None = None) -> str | dict:
+    """首页省略 cursor，续读传入 next_cursor。page 兼容旧调用。"""
+    if cursor is not None:
+        if cursor < 1 or page not in (1, cursor):
+            return "cursor 需要正整数，且不能与 page 指定不同的续读位置。"
+        page = cursor
     if page < 1:
         return "page 需要是 1 或上次返回的 next_page 游标。"
     size = max(1, min(int(count), 30))
@@ -316,9 +321,10 @@ async def get_hot_posts(count: int = 10, page: int = 1, format: str = "markdown"
     if len(posts) < size:
         note = (note + " 本次热帖流可用的不同帖子少于请求数。").strip()
     meta = pagination(count, len(posts), 30, more, next_page, page)
+    meta.update(mode="cursor", next_cursor=next_page)
     if format == "json":
         return {"pagination": meta, "items": [post_record(p) for p in posts], "note": note}
-    head = "### 雪球热门讨论\n" + page_text(meta)
+    head = "### 雪球热门讨论\n" + page_text(meta) + f"　next_cursor={json.dumps(next_page)}（续读传给 cursor）"
     if note:
         head += "\n" + note
     return head + "\n" + "\n\n---\n\n".join(_render_post(p, i, body_limit=260) for i, p in enumerate(posts, 1))
@@ -361,6 +367,25 @@ async def search_users(query: str, count: int = 10, page: int = 1, format: str =
         out.append("\n".join(lines))
     out.append("请结合昵称、认证和简介确认目标用户，再将 user_id 传给 search_posts 或 get_user_posts。")
     return "\n\n".join(out)
+
+
+async def get_user_profile(user_id: str, format: str = "markdown") -> str | dict:
+    uid = _user_id(user_id)
+    if not uid:
+        return "user_id 需要雪球用户数字 ID 或主页链接。"
+    data = await get_client().get("/user/show.json", {"id": uid}, base=APP_API, referer=REFERER)
+    user = data.get("user", data) if isinstance(data, dict) else None
+    if not isinstance(user, dict) or str(user.get("id")) != uid:
+        return f"雪球未返回用户 {uid} 的匹配资料。"
+    profile = {key: user.get(key) for key in ("screen_name", "followers_count", "friends_count",
+                                              "status_count", "verified", "verified_description")}
+    profile.update(id=uid, description=strip_html(user.get("description")), created_at=iso_time(user.get("created_at")),
+                   url=f"https://xueqiu.com/u/{uid}")
+    if format == "json":
+        return profile
+    return (f"### {profile['screen_name'] or uid}（用户 ID {uid}）\n"
+            f"粉丝 {fmt_count(profile['followers_count'])}　关注 {fmt_count(profile['friends_count'])}　"
+            f"发帖 {fmt_count(profile['status_count'])}\n{profile['description']}\n{profile['url']}")
 
 
 async def _read_filtered(path, params, key, size, page, uid, filters):
@@ -424,7 +449,7 @@ async def _read_filtered(path, params, key, size, page, uid, filters):
     if len(selected) < size:
         notes.append(f"本次扫描 {scanned} 条候选，取得 {len(selected)} 条符合条件的帖子。")
     meta = pagination(size, len(selected), 30, more, next_page, page)
-    meta.update(scanned=scanned, upstream_max_page=last_source)
+    meta.update(scanned=scanned, upstream_max_page=last_source, upstream_page_size=batch)
     if retry_page:
         meta["retry_page"] = retry_page
     return selected, meta, " ".join(notes)
@@ -435,10 +460,13 @@ async def search_posts(
     since_id: str | int | None = None, since: str | None = None, until: str | None = None,
     original_only: bool = False, min_followers: int | None = None, format: str = "markdown",
     exact_phrase: bool = False, deduplicate: bool = True,
+    exclude_content_hashes: list[str] | None = None,
 ) -> str | dict:
     query = query.strip()
     if not query:
         return "query 不能为空；查看作者最新动态请使用 get_user_posts。"
+    if any(not re.fullmatch(r"[a-fA-F0-9]{64}", h) for h in (exclude_content_hashes or [])):
+        return "exclude_content_hashes 需要先前结果中非空的 SHA-256 content_hash 列表。"
     uid = _user_id(user_id) if user_id is not None else ""
     if user_id is not None and not uid:
         return "user_id 需要是雪球用户的正整数数字 ID。"
@@ -465,10 +493,12 @@ async def search_posts(
         note += f" 已排除 {rejected} 条无法通过作者身份校验的结果。"
     note += " 以下为关键词附近摘录；引用前请用 get_post 获取全文并核对上下文。"
     return _filtered_page(verified, meta, note, title, count, query, format,
-                          exact_phrase=exact_phrase, deduplicate=deduplicate)
+                          exact_phrase=exact_phrase, deduplicate=deduplicate,
+                          exclude_hashes={h.lower() for h in (exclude_content_hashes or [])})
 
 
-def _filtered_page(posts, meta, note, title, requested, query, format, *, exact_phrase=False, deduplicate=False):
+def _filtered_page(posts, meta, note, title, requested, query, format, *,
+                   exact_phrase=False, deduplicate=False, exclude_hashes=None):
     if exact_phrase:
         candidate_count = len(posts)
         phrase = search_text(query)
@@ -477,17 +507,24 @@ def _filtered_page(posts, meta, note, title, requested, query, format, *, exact_
         ))]
         if len(posts) < candidate_count:
             note += f" 本页有 {candidate_count - len(posts)} 条未匹配完整短语。"
-    if deduplicate:
+    if deduplicate or exclude_hashes:
         unique = []
         seen = set()
+        excluded = 0
         for post in posts:
             digest = content_hash(post)
-            if digest and digest in seen:
+            if digest and exclude_hashes and digest in exclude_hashes:
+                excluded += 1
+                continue
+            if deduplicate and digest and digest in seen:
                 continue
             seen.add(digest)
             unique.append(post)
-        if len(unique) < len(posts):
-            note += f" 本页已合并 {len(posts) - len(unique)} 条同文结果，保留首次命中。"
+        merged = len(posts) - len(unique) - excluded
+        if merged:
+            note += f" 本页已合并 {merged} 条同文结果，保留首次命中。"
+        if excluded:
+            note += f" 按已见内容哈希排除 {excluded} 条结果。"
         posts = unique
     meta.update(requested=requested, returned=len(posts))
     if format == "json":
@@ -546,7 +583,7 @@ async def _complete_body(st: dict) -> tuple[dict, str]:
 
 async def get_post(
     post_id: str, with_comments: bool = True, comment_count: int = 10, full_text: bool = True,
-    comment_page: int = 1, format: str = "markdown",
+    comment_page: int = 1, format: str = "markdown", page: int | None = None,
 ) -> str | dict:
     """帖子全文及最新评论（按时间倒序）。post_id 可从讨论 / 热帖列表里取。
 
@@ -556,6 +593,10 @@ async def get_post(
     if not pid.isdigit():
         return "post_id 需要是帖子的数字 ID。"
 
+    if page is not None:
+        if page < 1 or comment_page not in (1, page):
+            return "page 需要正整数，且不能与 comment_page 指定不同的评论页。"
+        comment_page = page
     size, comment_page = max(1, min(int(comment_count), 30)), max(1, int(comment_page))
     client = get_client()
     # 正文和评论只依赖 pid，一起发；评论区可能被关掉，失败不影响正文
@@ -662,4 +703,7 @@ async def get_user_posts(
     if len(posts) < len(raw):
         note += f" 已排除 {len(raw) - len(posts)} 条作者不符或身份不明的动态。"
     name = _author(posts[0])[0] if posts else "雪球用户"
+    if meta.get("has_more") is False and isinstance(meta.get("upstream_max_page"), int):
+        note += (f" 已到雪球动态接口的可见边界（上游每页 {meta['upstream_page_size']} 条，"
+                 f"末页 {meta['upstream_max_page']}）。更早的发帖历史无法用这次结果确认。")
     return _filtered_page(posts, meta, note, f"{name}（uid {uid}）的动态", count, "", format)

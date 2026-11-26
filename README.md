@@ -6,7 +6,7 @@
 
 **让 AI 直接查询雪球行情、财务报表与社区观点。**
 
-通过 Model Context Protocol（MCP），将[雪球](https://xueqiu.com)数据接入 Claude Code、Claude Desktop、Cherry Studio 等 MCP 客户端。提供 **29 个工具**，覆盖 **A 股、港股、美股**，行情查询还支持指数、ETF 和可转债。
+通过 Model Context Protocol（MCP），将[雪球](https://xueqiu.com)数据接入 Claude Code、Claude Desktop、Cherry Studio 等 MCP 客户端。提供 **30 个工具**，覆盖 **A 股、港股、美股**，行情查询还支持指数、ETF 和可转债。
 
 [快速开始](#快速开始) · [客户端接入](#客户端接入) · [使用示例](#使用示例) · [工具一览](#工具一览) · [登录与浏览器](#登录与浏览器) · [服务端部署](#服务端部署) · [配置参考](#配置参考) · [常见问题](#常见问题) · [开发与测试](#开发与测试)
 
@@ -170,30 +170,32 @@ get_post(post_id="上一步返回的帖子ID", with_comments=false)
 
 列表提供摘要或关键词附近的摘录，全文和列表均区分作者文字、`//@` 引用和被转发帖。归纳观点前应调用 `get_post` 读取全文，并保留作者、日期和原帖链接；无转发标记不等于原创，单页搜索为空也不等于作者从未讨论过该主题。
 
-帖子列表和详情均显示编辑状态。雪球返回有效的 `edited_at` 时显示“已编辑”和北京时间，缺少有效编辑时间时显示“未知”。转发帖和被转发原帖各自显示自己的编辑状态。
+帖子列表和详情均显示编辑状态。有效的 `edited_at` 显示为“已编辑”，明确返回空值显示为“未编辑”，缺少字段或值异常显示为“未知”。JSON 保留 `edited_at_raw`、`edited_at_present` 和 ISO 时间 `edited_at`。转发与原帖分别读取各自的字段，原帖的字段位于 `retweeted_status`。列表缺字段时可取详情核对。回测严格排除发布后编辑及未知记录时，只保留 `edited_after_creation == false`；复原某个历史时点的文字需要当时的快照。
 
 `get_user_posts` 和 `get_stock_discussions` 每页最多请求 30 条，超过 20 条时自动分批读取。两者都显示请求数和实返数。用户动态接口的 `10022` 也会出现在特定分页请求中，仅凭该错误无法确认账号登录状态。
 
 ### 导出 JSON、分页与增量采集
 
-所有 24 个只读工具都接受 `format="json"`。MCP 客户端可直接读取 `structuredContent`，只支持文本的客户端可对 `content[0].text` 调用 `JSON.parse`。默认返回 Markdown。JSON 中帖子和作者 ID 是字符串，计数是整数，缺失值为 `null`，时间使用带时区的 ISO 8601。金融数据的 `units` 单独给出金额币种、百分数或小数比率。
+所有 25 个只读工具都接受 `format="json"`。MCP 客户端可直接读取 `structuredContent`，只支持文本的客户端可对 `content[0].text` 调用 `JSON.parse`。默认返回 Markdown。JSON 中帖子和作者 ID 是字符串，计数是整数，缺失值为 `null`，时间使用带时区的 ISO 8601。金融数据的 `units` 单独给出金额币种、百分数或小数比率。
 
 ```text
-search_posts(query="茅台", count=30, since="2026-01-01", until="2026-11-26", original_only=true, min_followers=100, format="json")
+search_posts(query="茅台", count=30, since="2026-01-01", until="2026-11-26", original_only=true, min_followers=100, exact_phrase=true, deduplicate=true, format="json")
 get_user_posts(user_id="1422017996", since_id="400000000", count=30, format="json")
-get_post(post_id="392261408", comment_count=30, comment_page=2, format="json")
+get_post(post_id="392261408", comment_count=30, page=2, format="json")
 get_kline(symbol="SH600519", period="day", count=20, exclude_today=true, format="json")
 get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
 ```
 
-- 帖子列表及评论的 `pagination` 给出 `requested`、`returned`、单次上限 `max`、`has_more`、`next_page`。`has_more=null` 表示覆盖范围未知。续读时保持相同筛选和条数，将 `next_page` 原样传给 `page`，评论传给 `comment_page`。读取失败请查看 `note` 和可用的 `retry_page`。帖子头部的评论数可能包含楼中楼，分页针对评论接口实际可见的记录。
-- 热帖的 `next_page` 是上游游标。筛选后的搜帖和用户动态每次最多检查 8 个上游页，游标记录页内位置，`scanned` 为本次检查的条数。上游提供时，`upstream_max_page` 给出上游声明的页数。实时排序可能变化，跨调用落库时按帖子 ID 去重。
+- 帖子列表及评论的 `pagination` 给出 `requested`、`returned`、单次上限 `max`、`has_more`、`next_page`。`has_more=null` 表示覆盖范围未知。续读时保持相同筛选和条数，将 `next_page` 原样传给 `page`，评论也兼容 `comment_page`。读取失败请查看 `note` 和可用的 `retry_page`。帖子头部的评论数可能包含楼中楼，分页针对评论接口实际可见的记录。
+- 热帖用 `cursor=pagination.next_cursor` 续读，兼容字段 `next_page` 也携带同一游标。筛选后的搜帖和用户动态每次最多检查 8 个上游页，游标记录页内位置，`scanned` 为本次检查的条数。上游提供时，`upstream_max_page` 给出上游声明的页数，每个上游页的请求条数见 `upstream_page_size`。普通用户动态没有本地历史页数上限，主页发帖数可能不同于上游动态接口的可见总数。实时排序可能变化，跨调用落库时按帖子 ID 去重。
 - `since_id` 为排他下界。`since` 包含起点，`until` 若为时间则不含终点，若为日期则包含当日。无时区输入按北京时间解释。`original_only` 排除带转发标记、内联转述或正文仅有 @ 提及的记录。`min_followers` 指作者粉丝数，粉丝数缺失时无法通过该条件。
 - K 线、资金流的 `as_of` 是工具观测时间，`quote_as_of` 是行情快照时间。`is_partial=null` 表示现有市场状态不足以确认。`exclude_today=true` 按交易所当地日期排除当天，周、月、季、年 K 线同时排除覆盖当天的周期。资金累计按日期筛选后重新求和，不足完整窗口时金额为 `null`。
 
+如果客户端的工具列表缺少 `get_user_profile` 或 `get_post.page`，请重新连接该 MCP 并刷新工具清单。在保留旧清单的会话中，可以新建会话重新获取参数。
+
 ## 工具一览
 
-共 **29 个工具**。不同市场和标的的可用字段取决于雪球上游接口，部分功能仅适用于 A 股。
+共 **30 个工具**。不同市场和标的的可用字段取决于雪球上游接口，部分功能仅适用于 A 股。
 
 ### 搜索与行情
 
@@ -238,6 +240,8 @@ get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
 | `list_industries` | 申万行业分类 |
 | `get_hot_stocks` | 雪球人气榜 |
 
+`get_capital_flow` 在特大单两侧均为空且买卖两侧分别满足“大单 + 中单 + 小单 = 合计”时，返回 `order_flow_layout="three_reported_bands"`。这表示上游只分三档，无法从该接口取得独立特大单金额。
+
 ### 社区论坛
 
 | 工具 | 说明 |
@@ -245,7 +249,8 @@ get_capital_flow(symbol="SH600519", days=20, exclude_today=true, format="json")
 | `get_stock_discussions` | 个股讨论区，可按热度或时间排序 |
 | `get_stock_news` | 个股新闻 / 公司公告流 |
 | `get_hot_posts` | 雪球首页热门讨论 |
-| `search_posts` | 按关键词搜索帖子，可用 `user_id` 限定作者、`exact_phrase=true` 匹配连续短语。默认每页按内容去重 |
+| `search_posts` | 按关键词搜索帖子，可用 `user_id` 限定作者、`exact_phrase=true` 匹配连续短语。默认每页按内容去重，跨页可传 `exclude_content_hashes` 排除此前已保存的内容 |
+| `get_user_profile` | 按用户 ID 或主页链接读取并核对资料，包含注册时间、粉丝数、关注数和发帖数 |
 | `search_users` | 按昵称或关键词搜索用户，返回用户 ID、主页、认证和简介 |
 | `get_post` | 帖子全文及最新评论，按时间倒序 |
 | `get_user_posts` | 某位用户的发帖动态 |

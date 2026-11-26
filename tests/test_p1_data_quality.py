@@ -80,6 +80,23 @@ class QualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("派息公告", result["metric_notes"]["dps"])
         self.assertIn("雪球 dps", table)
 
+    def test_three_bands_require_both_totals_and_no_separate_xlarge(self):
+        amounts = {f"{side}_{level}": value for side in ("buy", "sell")
+                   for level, value in (("large", 1.1), ("medium", 2.2), ("small", 3.3), ("total", 6.6))}
+        self.assertEqual(capital._order_layout(amounts), "three_reported_bands")
+        self.assertEqual(capital._order_layout({**amounts, "sell_total": 7}), "undetermined")
+        self.assertEqual(capital._order_layout({**amounts, "buy_xlarge": 0}), "xlarge_reported")
+
+    async def test_profile_rejects_an_unrelated_returned_account(self):
+        client = AsyncMock()
+        with patch.object(social, "get_client", return_value=client):
+            client.get.return_value = {"user": {"id": 99, "followers_count": 0}}
+            profile = await social.get_user_profile("https://xueqiu.com/99", format="json")
+            self.assertEqual((profile["id"], profile["followers_count"]), ("99", 0))
+            self.assertEqual(client.get.call_args.args[1], {"id": "99"})
+            failed = await server.get_user_profile("100", format="json")
+            self.assertTrue(failed.model_dump(by_alias=True)["isError"])
+
     async def test_exact_phrase_and_dedup_across_authors(self):
         client = AsyncMock()
         client.get.return_value = {"list": [
@@ -92,6 +109,9 @@ class QualityTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(social, "get_client", return_value=client):
             result = await social.search_posts("现金分红", exact_phrase=True, format="json")
             all_posts = await social.search_posts("现金分红", deduplicate=False, format="json")
+            seen = [all_posts["items"][0]["content_hash"]]
+            resumed = await social.search_posts("现金分红", exact_phrase=True, exclude_content_hashes=seen, format="json")
+        self.assertEqual([r["id"] for r in resumed["items"]], ["4", "5"])
         self.assertEqual([r["id"] for r in result["items"]], ["1", "4", "5"])
         self.assertIn("合并 1 条", result["note"])
         self.assertEqual(result["pagination"]["returned"], 3)
