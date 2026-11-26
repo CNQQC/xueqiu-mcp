@@ -146,7 +146,14 @@ class NeedLoginError(XueqiuError):
     所以两者都把完整的登录指引带上。
     """
 
-    def __init__(self, endpoint: str, desc: str = ""):
+    def __init__(self, endpoint: str, desc: str = "", code: Any = None):
+        if endpoint == "/v4/statuses/user_timeline.json" and str(code) == "10022":
+            # 该接口同一会话 count=20 可成功，count=25/30 却返回 10022。
+            super().__init__(
+                f"雪球用户动态接口返回 10022（{desc or '用户未登录'}）。"
+                "该响应也可能与请求条数或页码有关，无法据此确认账号登录状态。"
+            )
+            return
         detail = f"：{desc}" if desc else ""
         super().__init__(f"接口 {endpoint} 需要登录{detail}\n\n{LOGIN_GUIDE}")
 
@@ -159,7 +166,7 @@ def raise_business_error(endpoint: str, code: Any, desc: str) -> None:
     停在原地。
     """
     if str(code) in NEED_LOGIN_CODES or any(h in desc for h in NEED_LOGIN_HINTS):
-        raise NeedLoginError(endpoint, desc)
+        raise NeedLoginError(endpoint, desc, code)
     raise XueqiuError(f"雪球接口 {endpoint} 报错：{desc or code}")
 
 

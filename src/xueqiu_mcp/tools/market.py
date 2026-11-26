@@ -5,13 +5,15 @@ from __future__ import annotations
 from ..client import get_client
 from ..formatting import fmt_money, fmt_num, fmt_pct, fmt_share, md_table
 from ..screener import CATEGORIES, load_metrics, metric_label, validate
+from ..symbols import is_resolvable, market_of, normalize_symbol
 
 MARKETS = {
     "CN": ("A股", "sh_sz"),
     "HK": ("港股", None),
     "US": ("美股", None),
 }
-HOT_MARKETS = {"CN": 10, "US": 11, "HK": 12}
+# hot_stock/list 的 type=10 是跨市场榜。
+HOT_MARKETS = {"CN": 12, "US": 11, "HK": 13}
 CN_EXCHANGES = {"sh_sz": "沪深", "sh": "上交所", "sz": "深交所", "bj": "北交所"}
 
 # 指标 → 渲染单位。未列出的按数值渲染。
@@ -215,29 +217,30 @@ async def list_industries(market: str = "CN") -> str:
 
 async def get_hot_stocks(market: str = "CN", limit: int = 20) -> str:
     """雪球人气榜（按用户关注热度排序）。"""
-    market = (market or "CN").upper()
+    market = (market or "CN").strip().upper()
     if market not in HOT_MARKETS:
         return f"market 仅支持：{', '.join(HOT_MARKETS)}"
-    t = HOT_MARKETS[market]
     data = await get_client().get(
         "/v5/stock/hot_stock/list.json",
-        {"size": max(1, min(int(limit), 100)), "_type": t, "type": t},
+        {"size": max(1, min(int(limit), 100)), "type": HOT_MARKETS[market]},
     )
     items = (data.get("data") or {}).get("items") or []
     if not items:
         return "未取到人气榜数据。"
-    rows = [
-        [
+    rows = []
+    for i, it in enumerate(items, 1):
+        symbol = normalize_symbol(str(it.get("symbol") or it.get("code") or ""))
+        if not is_resolvable(symbol) or market_of(symbol) != market:
+            return f"雪球人气榜第 {i} 名的代码（{symbol or '缺失'}）无法匹配请求的{MARKETS[market][0]}市场。"
+        rows.append([
             str(i),
-            it.get("symbol") or it.get("code") or "-",
+            symbol,
             it.get("name") or "-",
             fmt_num(it.get("current"), 3),
             fmt_pct(it.get("percent"), signed=True),
             fmt_num(it.get("value")),
             f"{it.get('increment'):+d}" if isinstance(it.get("increment"), int) else "-",
-        ]
-        for i, it in enumerate(items, 1)
-    ]
+        ])
     return (
         f"### 雪球{MARKETS[market][0]}人气榜 Top {len(rows)}\n"
         "「热度」为雪球用户关注度指标，「热度变化」为较上一时段增减。\n\n"

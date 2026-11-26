@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from xueqiu_mcp.symbols import is_resolvable, market_of
 
 # (工具名, 参数, 期望在结果里出现的关键字)
 CASES: list[tuple[str, dict, list[str]]] = [
@@ -28,7 +30,10 @@ CASES: list[tuple[str, dict, list[str]]] = [
     ("screen_stocks", {"market": "CN", "order_by": "mc", "limit": 3, "filters": "pettm:0~15,dy_l:3~"}, ["选股", "市盈率TTM"]),
     ("list_screener_metrics", {"market": "CN", "keyword": "市盈"}, ["pettm"]),
     ("list_industries", {"market": "CN"}, ["行业分类", "S1101"]),
-    ("get_hot_stocks", {"market": "CN", "limit": 3}, ["人气榜"]),
+    ("get_hot_stocks", {"limit": 3}, ["A股人气榜 Top"]),
+    ("get_hot_stocks", {"market": "CN", "limit": 3}, ["A股人气榜 Top"]),
+    ("get_hot_stocks", {"market": "HK", "limit": 3}, ["港股人气榜 Top"]),
+    ("get_hot_stocks", {"market": "US", "limit": 3}, ["美股人气榜 Top"]),
     ("get_stock_discussions", {"symbol": "600519", "sort": "hot", "count": 2}, ["雪球讨论", "帖子ID"]),
     ("get_stock_news", {"symbol": "600519", "kind": "notice", "count": 2}, ["公告"]),
     ("get_hot_posts", {"count": 2}, ["雪球热门讨论"]),
@@ -73,6 +78,13 @@ def _geo_limited(name: str, body: str) -> bool:
 def _is_error(res) -> bool:
     """mcp 1.x 用 isError，2.x 用 is_error。"""
     return bool(getattr(res, "is_error", None) or getattr(res, "isError", None))
+
+
+def check_hot_stock_rows(body: str, market: str, limit: int) -> None:
+    codes = re.findall(r"^\| \d+ \| ([^|]*) \|", body, re.MULTILINE)
+    assert 0 < len(codes) <= limit, f"{market} 榜单实际返回 {len(codes)} 行"
+    for code in codes:
+        assert is_resolvable(code) and market_of(code) == market, f"{market} 榜单包含 {code}"
 
 
 async def main() -> int:
@@ -125,6 +137,8 @@ async def main() -> int:
                         print(f"   缺少关键字 {missing_kw}")
                         print(f"   返回: {body[:200]}")
                     else:
+                        if name == "get_hot_stocks":
+                            check_hot_stock_rows(body, args.get("market", "CN"), args["limit"])
                         ok += 1
                         print(f"✅ {name:26} {len(body):>6} 字符")
                 except Exception as e:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -105,6 +106,18 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             await c.get("/statuses/show.json")
         self.assertEqual(len(requests), 2)
 
+    async def test_timeline_10022_keeps_code_without_prescribing_login(self):
+        c, requests = self.client([httpx.Response(400, json={
+            "error_code": 10022, "error_description": "用户未登录",
+        })])
+        with patch.object(social, "get_client", return_value=c):
+            with self.assertRaises(NeedLoginError) as caught:
+                await social.get_user_posts("123", count=25)
+        self.assertEqual([r.url.params["count"] for r in requests], ["20", "20"])
+        self.assertIn("10022（用户未登录）", str(caught.exception))
+        self.assertIn("无法据此确认", str(caught.exception))
+        self.assertNotIn("login_with_cookie", str(caught.exception))
+
     async def test_search_scopes_have_separate_cache_entries(self):
         c, requests = self.client([httpx.Response(200, json={"list": [], "count": 0})])
         with patch.object(social, "get_client", return_value=c):
@@ -118,7 +131,73 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[2].url.params["uid"], "456")
 
 
+class PostPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_counts_and_consecutive_pages_for_both_feeds(self):
+        async def fetch(path, params, **kwargs):
+            size, page = params["count"], params["page"]
+            self.assertLessEqual(size, 20)
+            offset = (page - 1) * size
+            key = "statuses" if "user_id" in params else "list"
+            return {key: [{"id": i, "user_id": 123} for i in range(offset + 1, offset + size + 1)]}
+
+        client = AsyncMock()
+        client.get.side_effect = fetch
+        with patch.object(social, "get_client", return_value=client):
+            for tool, arg in [(social.get_user_posts, "123"), (social.get_stock_discussions, "SH600519")]:
+                for size in (20, 25, 30):
+                    for page in (1, 2):
+                        result = await tool(arg, count=size, page=page)
+                        self.assertIn(f"请求 {size} 条，实际返回 {size} 条", result)
+                        ids = list(map(int, re.findall(r"^帖子ID (\d+)", result, re.M)))
+                        self.assertEqual(ids, list(range((page - 1) * size + 1, page * size + 1)))
+
+    async def test_short_page_and_duplicates_do_not_shift_following_window(self):
+        def rows(ids):
+            return {"list": [{"id": i, "user_id": 123} for i in ids]}
+
+        second = rows([19, *range(21, 40)])
+        client = AsyncMock()
+        client.get.side_effect = [rows(range(1, 20)), second, second, rows(range(41, 61))]
+        with patch.object(social, "get_client", return_value=client):
+            first = await social.get_stock_discussions("SH600519", count=30)
+            following = await social.get_stock_discussions("SH600519", count=30, page=2)
+        self.assertIn("请求 30 条，实际返回 28 条", first)
+        self.assertIn("少于请求数", first)
+        first_ids = re.findall(r"^帖子ID (\d+)", first, re.M)
+        next_ids = re.findall(r"^帖子ID (\d+)", following, re.M)
+        self.assertFalse(set(first_ids) & set(next_ids))
+        self.assertEqual(len(set(next_ids)), 30)
+
+    async def test_partial_fetch_retains_verified_posts_and_reason(self):
+        client = AsyncMock()
+        client.get.side_effect = [
+            {"statuses": [{"id": 1, "user_id": 123}, {"id": 2, "user_id": 456}]},
+            XueqiuError("访问频率太快"),
+        ]
+        with patch.object(social, "get_client", return_value=client):
+            result = await social.get_user_posts("123", count=25)
+        for detail in ("请求 25 条，实际返回 1 条", "上游第 2 页读取失败", "访问频率太快", "已排除 1 条", "帖子ID 1"):
+            self.assertIn(detail, result)
+        self.assertNotIn("帖子ID 2", result)
+
+
 class SearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_time_is_shown_in_results_and_detail(self):
+        post = {"id": 1, "user_id": 123, "text": "正文", "edited_at": 1780363943000}
+        client = AsyncMock()
+        client.get.side_effect = [{"list": [post]}, post]
+        with patch.object(social, "get_client", return_value=client):
+            results = await social.search_posts("正文")
+            detail = await social.get_post("1", with_comments=False)
+        for output in (results, detail):
+            self.assertIn("编辑状态：已编辑（2026-06-02 09:32:23）", output)
+
+    def test_missing_edit_evidence_stays_unknown(self):
+        permissions = {"editable": True, "canEdit": True, "updated_at": 1780363943000}
+        for extra in ({}, {"edited_at": None}, {"edited_at": 0}, {"edited_at": True}, {"edited_at": "bad"}):
+            with self.subTest(extra=extra):
+                self.assertEqual(social._edit_status({**permissions, **extra}), "编辑状态：未知")
+
     async def test_partial_nickname_does_not_pick_first_same_name_account(self):
         client = AsyncMock()
         client.get.return_value = {"list": [
@@ -188,7 +267,7 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         body = "这是本人文字" * 100
         client.get.return_value = {
             "id": 1, "user_id": 123, "text": body + "//@别人:他人的看法",
-            "retweeted_status": {"id": 2, "user_id": 456, "text": "原帖文字"},
+            "retweeted_status": {"id": 2, "user_id": 456, "text": "原帖文字", "edited_at": 1780363943000},
         }
         with patch.object(social, "get_client", return_value=client):
             result = await social.get_post("1", with_comments=False)
@@ -196,6 +275,9 @@ class SearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("引用文字（不代表本条作者的新观点）", result)
         self.assertIn("https://xueqiu.com/456/2", result)
         self.assertIn("作者 user_id: 123", result)
+        outer, original = result.split("被转发帖（")
+        self.assertIn("编辑状态：未知", outer)
+        self.assertIn("编辑状态：已编辑（2026-06-02 09:32:23）", original)
 
     async def test_user_keyword_search_returns_ids_and_disambiguation(self):
         client = AsyncMock()

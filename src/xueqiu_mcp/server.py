@@ -47,6 +47,7 @@ user_id=该账号ID)。不要仅把人名拼进全站搜索的 query，否则会
 搜索无结果不等于作者没有说过；可缩短关键词、翻页或用 get_user_posts 查看近期动态。
 
 接口偶发返回「未登录」时，客户端会使用现有凭证自动重试一次，不会清除登录态。
+用户动态接口的 10022 同样出现在特定分页请求中，单凭该错误无法确认账号登录状态。
 关于登录：少数受风控保护的社区接口和账号相关数据需要登录。自动重试后仍因未登录
 而失败，返回的报错里会**直接带上完整的登录步骤** —— 请把那些步骤转述给用户，不要
 只回一句「需要登录」就停下。首选 get_login_qrcode（立即返回二维码图片和临时登录链接，
@@ -322,7 +323,7 @@ async def get_stock_discussions(
     Args:
         symbol: 股票代码
         sort: hot 按热度（高赞高评论）/ time 按最新
-        count: 条数，最多 30
+        count: 每页最多 30 条，超过 20 条自动分批获取，结果显示请求数和实返数
         page: 页码
     """
     return await social.get_stock_discussions(symbol, sort, count, page)
@@ -391,6 +392,7 @@ async def get_post(
 ) -> str:
     """按帖子 ID 取全文及热门评论。ID 可从讨论列表或热帖列表中获得。
 
+    返回发布时间和编辑状态。雪球提供编辑时间时显示“已编辑”和北京时间，否则显示“未知”。
     正文残缺时（雪球置了 truncated，或正文为空的付费 / 仅粉丝可见内容）会用本机
     浏览器把完整正文取回来，需要装浏览器支持，没装就照常返回并给出提示。
 
@@ -409,7 +411,7 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
 
     Args:
         user_id: 雪球用户数字 ID 或主页/帖子链接（xueqiu.com/<user_id>/<post_id>）
-        count: 条数，最多 30
+        count: 每页最多 30 条，超过 20 条自动分批获取，结果显示请求数和实返数
         page: 页码
     """
     return await social.get_user_posts(user_id, count, page)

@@ -12,11 +12,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
-from ..client import APP_API, get_client
-from ..formatting import fmt_count, fmt_ts, post_url, strip_html
+import httpx
+
+from ..client import APP_API, XueqiuError, get_client
+from ..formatting import CN_TZ, fmt_count, fmt_ts, post_url, strip_html
 from ..resolve import resolve_symbol
 
 log = logging.getLogger("xueqiu_mcp")
@@ -69,6 +72,18 @@ def _excerpt(text: str, limit: int | None, query: str = "") -> str:
     return ("…" if start else "") + text[start:start + limit] + ("…" if start + limit < len(text) else "")
 
 
+def _edit_status(st: dict) -> str:
+    """雪球用毫秒时间戳 edited_at 记录编辑，editable 和 canEdit 表示权限。"""
+    try:
+        millis = int(str(st.get("edited_at")))
+        if millis > 0:
+            edited = datetime.fromtimestamp(millis / 1000, CN_TZ)
+            return f"编辑状态：已编辑（{edited:%Y-%m-%d %H:%M:%S}）"
+    except (ValueError, OverflowError, OSError):
+        pass
+    return "编辑状态：未知"
+
+
 def _post_body(st: dict, limit: int | None, query: str = "") -> str:
     """将当前作者文字、内联引用、被转发帖分开，避免把他人的观点算给当前作者。"""
     body = strip_html(st.get("text")) or strip_html(st.get("description"))
@@ -80,7 +95,7 @@ def _post_body(st: dict, limit: int | None, query: str = "") -> str:
     if original:
         name, _ = _author(original)
         text = strip_html(original.get("text")) or strip_html(original.get("description"))
-        parts.append(f"被转发帖（作者：{name}）：\n{_excerpt(text, limit, query)}\n{post_url(original)}")
+        parts.append(f"被转发帖（作者：{name}）：\n{_edit_status(original)}\n{_excerpt(text, limit, query)}\n{post_url(original)}")
     elif st.get("retweet_status_id"):
         parts.append(f"被转发帖 ID：{st['retweet_status_id']}（正文未返回，可用 get_post 查阅）")
     return "\n\n".join(parts) or "（无正文，可能是图片或视频帖）"
@@ -103,6 +118,7 @@ def _render_post(st: dict, idx: int | None = None, body_limit: int = 220, query:
     )
     if st.get("view_count"):
         meta += f" 阅{fmt_count(st.get('view_count'))}"
+    meta += f"　{_edit_status(st)}"
     uid = st.get("user_id") or (st.get("user") or {}).get("id")
     kind = "转发/回复，需区分本人文字与引用" if st.get("retweet_status_id") or st.get("retweeted_status") else "本人发布（无转发标记，不保证内容原创）"
     lines = [head, meta, f"作者 user_id: {uid or '未知'}　类型：{kind}", _post_body(st, body_limit, query)]
@@ -110,6 +126,47 @@ def _render_post(st: dict, idx: int | None = None, body_limit: int = 220, query:
     if url:
         lines.append(f"帖子ID {st.get('id')}　{url}")
     return "\n".join(x for x in lines if x)
+
+
+async def _fetch_post_page(
+    path: str, params: dict, key: str, size: int, page: int, referer: str,
+) -> tuple[list[dict], dict, str]:
+    """将工具页映射到不超过 20 条的上游页。短页保留自己的位置，避免下页重读。"""
+    batch_size = min(size, 20)
+    start = (page - 1) * size
+    stop = start + size
+    posts = []
+    seen = set()
+    data = {}
+    note = ""
+    client = get_client()
+    for batch_index in range(start // batch_size, (stop - 1) // batch_size + 1):
+        upstream_page = batch_index + 1
+        try:
+            data = await client.get(
+                path, {**params, "count": batch_size, "page": upstream_page},
+                base=APP_API, referer=referer,
+            )
+        except (XueqiuError, httpx.RequestError) as exc:
+            if not posts:
+                raise
+            note = f"上游第 {upstream_page} 页读取失败，已保留取到的帖子。{exc}"
+            break
+        batch = data.get(key) or []
+        batch_start = batch_index * batch_size
+        for post in batch[max(0, start - batch_start):min(batch_size, stop - batch_start)]:
+            pid = post.get("id")
+            if pid is not None:
+                if str(pid) in seen:
+                    continue
+                seen.add(str(pid))
+            posts.append(post)
+        last_page = data.get("maxPage")
+        if isinstance(last_page, int) and upstream_page >= last_page:
+            break
+    if len(posts) < size and not note:
+        note = "雪球在本页范围内返回的不同帖子数少于请求数。"
+    return posts, data, note
 
 
 async def get_stock_discussions(
@@ -120,25 +177,24 @@ async def get_stock_discussions(
         return f"sort 仅支持：{', '.join(SORT_MODES)}"
     sym = await resolve_symbol(symbol)
     label, api_sort = SORT_MODES[sort]
-    count = max(1, min(int(count), 30))
+    size = max(1, min(int(count), 30))
+    page = max(1, int(page))
 
-    data = await get_client().get(
+    posts, data, note = await _fetch_post_page(
         "/query/v1/symbol/search/status",
-        {
-            "symbol": sym, "count": count, "page": max(1, int(page)),
-            "source": "user", "sort": api_sort, "comment": 0, "hl": 0, "q": "",
-        },
-        base=APP_API,
-        referer=f"https://xueqiu.com/S/{sym}",
+        {"symbol": sym, "source": "user", "sort": api_sort, "comment": 0, "hl": 0, "q": ""},
+        "list", size, page, f"https://xueqiu.com/S/{sym}",
     )
-    posts = data.get("list") or []
-    if not posts:
-        return f"{sym} 暂无讨论内容。"
-
-    head = f"### {sym} 雪球讨论（{label}，第 {page} 页，共约 {data.get('count', '?')} 条）\n"
-    return head + "\n\n---\n\n".join(
-        _render_post(p, i) for i, p in enumerate(posts, (page - 1) * count + 1)
+    head = (
+        f"### {sym} 雪球讨论（{label}，第 {page} 页，请求 {count} 条，实际返回 {len(posts)} 条，"
+        f"共约 {data.get('count', '?')} 条）"
     )
+    if note:
+        head += "\n" + note
+    body = "\n\n---\n\n".join(
+        _render_post(p, i) for i, p in enumerate(posts, (page - 1) * size + 1)
+    )
+    return head + "\n" + (body or "本页暂无讨论内容。")
 
 
 async def get_stock_news(symbol: str, kind: str = "news", count: int = 10, page: int = 1) -> str:
@@ -169,7 +225,7 @@ async def get_stock_news(symbol: str, kind: str = "news", count: int = 10, page:
             body = ""
         url = post_url(it)
         out.append(
-            f"**{i}. {title}**\n{fmt_ts(it.get('created_at'), '%Y-%m-%d %H:%M')}"
+            f"**{i}. {title}**\n{fmt_ts(it.get('created_at'), '%Y-%m-%d %H:%M')}　{_edit_status(it)}"
             + (f"　{body}" if body else "")
             + (f"\n{url}" if url else "")
         )
@@ -361,7 +417,7 @@ async def get_post(
         f"### {title or '（无标题）'}",
         f"作者：{who}　发布：{fmt_ts(st.get('created_at'), '%Y-%m-%d %H:%M')}"
         f"　赞{fmt_count(st.get('like_count'))} 评{fmt_count(st.get('reply_count'))}"
-        f" 转{fmt_count(st.get('retweet_count'))}",
+        f" 转{fmt_count(st.get('retweet_count'))}　{_edit_status(st)}",
         post_url(st),
         "",
         f"作者 user_id: {st.get('user_id') or (st.get('user') or {}).get('id') or '未知'}",
@@ -389,15 +445,17 @@ async def get_user_posts(user_id: str, count: int = 10, page: int = 1) -> str:
     if not uid:
         return "user_id 需要是雪球用户的数字 ID（可在帖子链接 xueqiu.com/<user_id>/<post_id> 中找到）。"
 
-    data = await get_client().get(
-        "/v4/statuses/user_timeline.json",
-        {"user_id": uid, "page": max(1, int(page)), "count": max(1, min(int(count), 30))},
-        base=APP_API,
-        referer=REFERER,
+    size = max(1, min(int(count), 30))
+    page = max(1, int(page))
+    raw, _, note = await _fetch_post_page(
+        "/v4/statuses/user_timeline.json", {"user_id": uid}, "statuses", size, page, REFERER,
     )
-    posts = [p for p in (data.get("statuses") or []) if _is_author(p, uid)]
-    if not posts:
-        return f"用户 {uid} 暂无公开动态。"
-    name, _ = _author(posts[0])
-    head = f"### {name}（uid {uid}）的动态（第 {page} 页，本页 {len(posts)} 条）\n"
-    return head + "\n\n---\n\n".join(_render_post(p, i) for i, p in enumerate(posts, 1))
+    posts = [p for p in raw if _is_author(p, uid)]
+    name = _author(posts[0])[0] if posts else "雪球用户"
+    head = f"### {name}（uid {uid}）的动态（第 {page} 页，请求 {count} 条，实际返回 {len(posts)} 条）"
+    if len(posts) < len(raw):
+        head += f"\n已排除 {len(raw) - len(posts)} 条作者不符或身份不明的动态。"
+    if note:
+        head += "\n" + note
+    body = "\n\n---\n\n".join(_render_post(p, i) for i, p in enumerate(posts, 1))
+    return head + "\n" + (body or "本页暂无可核实的公开动态。")
